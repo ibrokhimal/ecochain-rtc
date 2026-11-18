@@ -178,6 +178,8 @@ impl Room {
         tracing::info!(room = %self.id, "room started");
         let mut tick = tokio::time::interval(TICK);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut addresses = self.services.sockets.subscribe();
+        addresses.mark_unchanged();
         while !self.ended {
             let deadline = self.next_timeout();
             tokio::select! {
@@ -195,6 +197,7 @@ impl Room {
                 }
                 _ = tokio::time::sleep_until(deadline.into()) => {}
                 _ = tick.tick() => self.housekeeping(),
+                Ok(()) = addresses.changed() => self.media_addresses_changed(),
             }
             self.drive();
         }
@@ -485,9 +488,16 @@ impl Room {
         };
 
         let dedup = request.needs_dedup();
-        let fingerprint = if dedup { request_fingerprint(&request) } else { 0 };
+        let fingerprint = if dedup {
+            request_fingerprint(&request)
+        } else {
+            0
+        };
         if dedup {
-            if let Some(cached) = self.participants[index].responses.get(&request_id, fingerprint) {
+            if let Some(cached) = self.participants[index]
+                .responses
+                .get(&request_id, fingerprint)
+            {
                 conn.send(response(&request_id, cached.clone()));
                 return;
             }

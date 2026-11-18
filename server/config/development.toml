@@ -25,4 +25,7 @@ udp_port = 7882
 # the same Wi-Fi, the iOS Simulator and the Android emulator (via the LAN IP)
 # can connect.
 listen = []
+# With an empty list the server follows the primary address when the
+# machine joins another network (no restart needed). Set false to pin it.
+follow_primary = true
 ice_servers = []

@@ -480,9 +480,12 @@ async fn reused_request_id_after_resume_runs_the_new_request() {
     // for a different request. It must run, not get the cached answer.
     host.drop_connection().await;
     let mut host = server.signal().await;
-    host.request("join", json!({"token": token, "resume_session_id": session}))
-        .await
-        .unwrap();
+    host.request(
+        "join",
+        json!({"token": token, "resume_session_id": session}),
+    )
+    .await
+    .unwrap();
     host.request_with_id("r2", "participant.remove", json!({"participant_id": g2_id}))
         .await
         .unwrap();

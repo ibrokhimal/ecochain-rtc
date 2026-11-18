@@ -106,3 +106,43 @@ async fn signaling_drop_keeps_media_flowing() {
     alice.leave().await;
     bob.leave().await;
 }
+
+#[tokio::test]
+async fn server_address_change_moves_media() {
+    let Some(lan) = ecochain_rtc_server::config::primary_lan_ip() else {
+        eprintln!("SKIP: no LAN address");
+        return;
+    };
+    let server = common::start_following_primary().await;
+    let sockets = &server.server.sockets;
+    let before = sockets.advertised();
+    let (alice, bob) = pair(&server, "server-moves").await;
+
+    // The server's network changes: its media socket moves to another address.
+    let mut changes = sockets.subscribe();
+    assert!(sockets.move_primary(lan).unwrap());
+    changes.changed().await.unwrap();
+    let after = sockets.advertised();
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].ip(), lan);
+    assert_eq!(after[0].port(), before[0].port(), "port is kept");
+    assert!(
+        !sockets.move_primary(lan).unwrap(),
+        "same address is a no-op"
+    );
+
+    // Clients notice the broken path and restart ICE (the SDK's ICE monitor);
+    // the restart negotiation carries the new server candidate.
+    let moved = Instant::now();
+    alice.switch_network();
+    bob.switch_network();
+    let to_bob = audio_recovery(&bob, moved).await;
+    let to_alice = audio_recovery(&alice, moved).await;
+    println!(
+        "RESULT server_address_change audio_recovery alice->bob={to_bob:?} bob->alice={to_alice:?}"
+    );
+    single_seat(&alice);
+    single_seat(&bob);
+    alice.leave().await;
+    bob.leave().await;
+}

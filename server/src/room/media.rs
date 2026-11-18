@@ -374,6 +374,28 @@ impl Room {
     // Subscriber
     // ----------------------------------------------------------------------
 
+    /// The server's media sockets changed (new network): update the host
+    /// candidates of every peer. Clients whose path broke restart ICE
+    /// (SDK ICE monitor) and get the new address in that negotiation.
+    pub(super) fn media_addresses_changed(&mut self) {
+        let sockets = &self.services.sockets;
+        let mut peers = 0;
+        for participant in &mut self.participants {
+            for peer in [
+                participant.publisher.as_mut(),
+                participant.subscriber.as_mut().map(|s| &mut s.peer),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if peer.sync_local_candidates(sockets) {
+                    peers += 1;
+                }
+            }
+        }
+        tracing::info!(room = %self.id, peers, addresses = ?sockets.advertised(), "media addresses updated");
+    }
+
     pub(super) fn create_subscriber(&mut self, index: usize) {
         let peer = Peer::new(
             PeerKind::Subscriber,
@@ -420,6 +442,11 @@ impl Room {
             .map_err(|e| {
                 ProtocolError::new(ErrorCode::InvalidState, format!("answer rejected: {e}"))
             })?;
+        // After an ICE restart offer the new credentials take effect only
+        // now; without re-registering, the client's checks with the new
+        // ufrag are unroutable until some unrelated packet maps its address.
+        sub.peer
+            .refresh_ufrag(&self.services.sockets, &self.packets_tx);
         sub.peer.wake(Instant::now());
 
         let mut opened = Vec::new();

@@ -173,6 +173,12 @@ struct FileMediaConfig {
     listen: Vec<MediaListen>,
     #[serde(default)]
     ice_servers: Vec<IceServer>,
+    #[serde(default = "default_true")]
+    follow_primary: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// One UDP media socket.
@@ -184,6 +190,10 @@ pub struct MediaListen {
     /// Address announced to clients as the ICE host candidate. Use the public
     /// IP when the server sits behind 1:1 NAT (for example a cloud VM).
     pub advertise_ip: Option<IpAddr>,
+    /// Picked automatically (empty `media.listen`). The server then follows
+    /// the primary address when the machine changes networks.
+    #[serde(skip)]
+    pub auto: bool,
 }
 
 /// STUN/TURN server handed to clients in the join response.
@@ -209,6 +219,9 @@ pub struct MediaConfig {
     pub listen: Vec<MediaListen>,
     /// Extra ICE servers for clients.
     pub ice_servers: Vec<IceServer>,
+    /// With an empty `listen`, move the media socket when the machine's
+    /// primary address changes (new Wi-Fi). Default `true`.
+    pub follow_primary: bool,
 }
 
 /// Fully validated server configuration.
@@ -328,6 +341,7 @@ pub fn parse(
             udp_port: file.media.udp_port,
             listen,
             ice_servers: file.media.ice_servers,
+            follow_primary: file.media.follow_primary,
         },
     })
 }
@@ -359,30 +373,36 @@ fn resolve_secret(
 }
 
 /// Picks the machine's primary LAN address (and loopback in development).
-///
-/// The primary address is found by "connecting" a UDP socket to a public
-/// address; no packet is sent, the OS only selects the outgoing interface.
 fn default_media_listen(production: bool) -> Vec<MediaListen> {
     let mut listen = Vec::new();
-    let lan = std::net::UdpSocket::bind("0.0.0.0:0")
-        .and_then(|s| s.connect("8.8.8.8:80").map(|_| s))
-        .and_then(|s| s.local_addr())
-        .map(|a| a.ip())
-        .ok()
-        .filter(|ip| !ip.is_unspecified() && !ip.is_loopback());
-    if let Some(ip) = lan {
+    if let Some(ip) = primary_lan_ip() {
         listen.push(MediaListen {
             bind_ip: ip,
             advertise_ip: None,
+            auto: true,
         });
     }
     if !production {
         listen.push(MediaListen {
             bind_ip: IpAddr::from([127, 0, 0, 1]),
             advertise_ip: None,
+            auto: false,
         });
     }
     listen
+}
+
+/// The address of the interface that carries the default route, if any.
+///
+/// Found by "connecting" a UDP socket to a public address; no packet is
+/// sent, the OS only selects the outgoing interface.
+pub fn primary_lan_ip() -> Option<IpAddr> {
+    std::net::UdpSocket::bind("0.0.0.0:0")
+        .and_then(|s| s.connect("8.8.8.8:80").map(|_| s))
+        .and_then(|s| s.local_addr())
+        .map(|a| a.ip())
+        .ok()
+        .filter(|ip| !ip.is_unspecified() && !ip.is_loopback())
 }
 
 #[cfg(test)]

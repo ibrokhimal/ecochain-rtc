@@ -7,7 +7,7 @@
 //! either side can be rebuilt without touching the other.
 
 use super::udp::{Datagram, MediaSockets, RoomPackets};
-use std::time::Instant;
+use std::{net::SocketAddr, time::Instant};
 use str0m::{
     bwe::Bitrate,
     net::{Protocol, Receive},
@@ -36,6 +36,8 @@ pub struct Peer {
     ufrag: String,
     next_timeout: Instant,
     remote_candidates: usize,
+    /// Media socket addresses added as host candidates.
+    local: Vec<SocketAddr>,
 }
 
 /// Upper bound of trickled candidates per peer. A real client sends a
@@ -55,23 +57,49 @@ impl Peer {
             // media on them.
             config = config.enable_bwe(Some(INITIAL_SUBSCRIBER_BITRATE));
         }
-        let mut rtc = config.build(now);
-        for addr in sockets.advertised() {
-            match Candidate::host(addr, "udp") {
-                Ok(candidate) => {
-                    rtc.add_local_candidate(candidate);
-                }
-                Err(e) => tracing::warn!(%addr, error = ?e, "invalid host candidate"),
-            }
-        }
+        let rtc = config.build(now);
         sockets.register_ufrag(&creds.ufrag, room.clone());
-        Self {
+        let mut peer = Self {
             rtc,
             kind,
             ufrag: creds.ufrag,
             next_timeout: now,
             remote_candidates: 0,
+            local: Vec::new(),
+        };
+        peer.sync_local_candidates(sockets);
+        peer
+    }
+
+    /// Makes the host candidates match the current media sockets: new
+    /// addresses are added, vanished ones invalidated (their candidate
+    /// pairs stop). Returns whether anything changed.
+    ///
+    /// The client learns new candidates from the next SDP of this peer,
+    /// which follows the ICE restart it starts when the old path fails.
+    pub fn sync_local_candidates(&mut self, sockets: &MediaSockets) -> bool {
+        let current = sockets.advertised();
+        let mut changed = false;
+        for addr in self.local.iter().filter(|a| !current.contains(a)) {
+            if let Ok(candidate) = Candidate::host(*addr, "udp") {
+                self.rtc.direct_api().invalidate_candidate(&candidate);
+                changed = true;
+            }
         }
+        for addr in current.iter().filter(|a| !self.local.contains(a)) {
+            match Candidate::host(*addr, "udp") {
+                Ok(candidate) => {
+                    self.rtc.add_local_candidate(candidate);
+                    changed = true;
+                }
+                Err(e) => tracing::warn!(%addr, error = ?e, "invalid host candidate"),
+            }
+        }
+        self.local = current;
+        if changed {
+            self.wake(Instant::now());
+        }
+        changed
     }
 
     /// Updates the STUN route after ICE credentials changed (ICE restart).

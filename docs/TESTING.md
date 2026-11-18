@@ -89,7 +89,7 @@ Boshqa Wi‑Fi’da (router, server `172.16.137.58`, Mac `172.16.137.69`, ping 6
 
 `send_error` va `send_queue_full` 0. Demak hotspot’dagi yo‘qotish tarmoq sig‘imi edi, server emas.
 
-Tarmoq almashganda: media socket IP’si faqat ishga tushishda aniqlanadi, shuning uchun server yangi Wi‑Fi’da **qayta ishga tushirilishi kerak** (aks holda signaling ishlaydi, lekin media eski IP’ga e’lon qilinadi). Yangi IP: serverda `hostname -I`.
+Tarmoq almashganda: `media.listen` bo‘sh bo‘lsa, server asosiy IP’ni har 3 s tekshiradi va o‘zgarsa media socket’ni yangi manzilga (o‘sha port) ko‘chiradi, barcha peer’larga yangi host candidate qo‘shib, eskisini bekor qiladi. Qayta ishga tushirish kerak emas. Mavjud qo‘ng‘iroqlar faqat klientlar serverga nom orqali ulangan bo‘lsa tiklanadi (`ubuntu.local`, DNS): IP bilan ulangan klient eski manzilga signaling ham qila olmaydi, yangi klientlar esa yangi IP bilan darrov ulanadi. Test: `tests/resilience.rs::server_address_change_moves_media` (loopback → LAN IP, ICE restart’dan keyin audio ~330 ms da tiklandi). Shu test subscriber ICE restart’dagi eski xatoni ham topdi: yangi ufrag faqat answer qabul qilingandan keyin kuchga kiradi, server esa uni offer paytida ro‘yxatdan o‘tkazardi, shuning uchun yangi manzildan kelgan STUN marshrutlanmasdi (`unrouted`). Endi ufrag answer’dan keyin ham yangilanadi. Yangi IP: serverda `hostname -I` yoki `ssh user01@ubuntu.local hostname -I`.
 
 Sinov paytida topilgan va tuzatilgan muammolar:
 

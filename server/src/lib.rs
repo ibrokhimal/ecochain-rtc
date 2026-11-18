@@ -48,8 +48,11 @@ pub struct App {
 pub struct Server {
     /// Address the HTTP/WebSocket listener is bound to.
     pub http_addr: SocketAddr,
-    /// Advertised media addresses.
+    /// Advertised media addresses at startup.
     pub media_addrs: Vec<SocketAddr>,
+    /// Media sockets (their addresses can change, see
+    /// [`MediaSockets::follow_primary`]).
+    pub sockets: MediaSockets,
     /// Shared state, useful for tests.
     pub app: Arc<App>,
     /// Resolves when the HTTP server stops.
@@ -69,7 +72,7 @@ pub async fn start(config: Config) -> anyhow::Result<Server> {
     let config = Arc::new(config);
     let metrics = Arc::new(Metrics::default());
 
-    let media: Vec<(SocketAddr, Option<std::net::IpAddr>)> = config
+    let media: Vec<(SocketAddr, Option<std::net::IpAddr>, bool)> = config
         .media
         .listen
         .iter()
@@ -77,14 +80,20 @@ pub async fn start(config: Config) -> anyhow::Result<Server> {
             (
                 SocketAddr::new(l.bind_ip, config.media.udp_port),
                 l.advertise_ip,
+                l.auto,
             )
         })
         .collect();
     let sockets = MediaSockets::bind(&media, metrics.clone()).await?;
+    if config.media.follow_primary && config.media.listen.iter().any(|l| l.auto) {
+        // Laptops and Wi-Fi servers change networks; follow the new address
+        // instead of announcing one that no longer exists.
+        sockets.follow_primary(crate::config::primary_lan_ip);
+    }
     let media_addrs = sockets.advertised();
 
     let app = Arc::new(App {
-        rooms: Rooms::new(config.clone(), metrics.clone(), sockets),
+        rooms: Rooms::new(config.clone(), metrics.clone(), sockets.clone()),
         config: config.clone(),
         metrics,
         next_connection_id: AtomicU64::new(1),
@@ -114,6 +123,7 @@ pub async fn start(config: Config) -> anyhow::Result<Server> {
     Ok(Server {
         http_addr,
         media_addrs,
+        sockets,
         app,
         task,
     })

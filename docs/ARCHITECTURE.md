@@ -42,7 +42,7 @@ Har xona — bitta tokio task, unga signaling va UDP dispatcher faqat kanal orqa
 
 ### UDP marshrutlash
 
-Barcha xonalar bitta UDP portni (standart 7882) ishlatadi. Notanish manzildan kelgan STUN so‘rovidagi `USERNAME` (`server_ufrag:client_ufrag`) orqali xona topiladi va manzil eslab qolinadi; keyingi DTLS/SRTP shu manzil bo‘yicha boradi. Wi‑Fi → mobil tarmoq almashganda yangi manzil yana STUN bilan boshlanadi, shuning uchun roaming alohida kod talab qilmaydi.
+Barcha xonalar bitta UDP portni (standart 7882) ishlatadi. Notanish manzildan kelgan STUN so‘rovidagi `USERNAME` (`server_ufrag:client_ufrag`) orqali xona topiladi va manzil eslab qolinadi; keyingi DTLS/SRTP shu manzil bo‘yicha boradi. Wi‑Fi → mobil tarmoq almashganda yangi manzil yana STUN bilan boshlanadi, shuning uchun roaming alohida kod talab qilmaydi. Serverning o‘z tarmog‘i o‘zgarsa (`media.listen` bo‘sh, `media.follow_primary = true` standart): asosiy IP har 3 s tekshiriladi, avtomatik socket yangi manzilga ko‘chiriladi, xonalar `watch` kanali orqali xabar olib, har peer’da host candidate’ni almashtiradi; klient ICE restart qilganda yangi manzilni oladi.
 
 ### Simulcast va tarmoqqa moslashish
 
