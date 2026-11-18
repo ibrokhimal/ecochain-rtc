@@ -56,6 +56,11 @@ pub struct PublishedTrack {
     pub layers: Vec<Rid>,
     /// Last keyframe request sent to the publisher, for throttling.
     pub last_keyframe_request: Option<Instant>,
+    /// Last camera rotation the publisher signalled (RTP
+    /// `urn:3gpp:video-orientation`). Phones send unrotated frames plus this
+    /// value; it is copied onto every forwarded frame so that receivers,
+    /// including ones that join mid-stream, render the picture upright.
+    pub orientation: Option<str0m::rtp::VideoOrientation>,
 }
 
 impl PublishedTrack {

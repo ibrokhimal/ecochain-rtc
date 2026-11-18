@@ -91,6 +91,12 @@ Boshqa Wi‑Fi’da (router, server `172.16.137.58`, Mac `172.16.137.69`, ping 6
 
 Tarmoq almashganda: `media.listen` bo‘sh bo‘lsa, server asosiy IP’ni har 3 s tekshiradi va o‘zgarsa media socket’ni yangi manzilga (o‘sha port) ko‘chiradi, barcha peer’larga yangi host candidate qo‘shib, eskisini bekor qiladi. Qayta ishga tushirish kerak emas. Mavjud qo‘ng‘iroqlar faqat klientlar serverga nom orqali ulangan bo‘lsa tiklanadi (`ubuntu.local`, DNS): IP bilan ulangan klient eski manzilga signaling ham qila olmaydi, yangi klientlar esa yangi IP bilan darrov ulanadi. Test: `tests/resilience.rs::server_address_change_moves_media` (loopback → LAN IP, ICE restart’dan keyin audio ~330 ms da tiklandi). Shu test subscriber ICE restart’dagi eski xatoni ham topdi: yangi ufrag faqat answer qabul qilingandan keyin kuchga kiradi, server esa uni offer paytida ro‘yxatdan o‘tkazardi, shuning uchun yangi manzildan kelgan STUN marshrutlanmasdi (`unrouted`). Endi ufrag answer’dan keyin ham yangilanadi. Yangi IP: serverda `hostname -I` yoki `ssh user01@ubuntu.local hostname -I`.
 
+### Real Android qurilma (2026-11-18)
+
+Huawei CTR-L91 (Android 12) + iOS Simulator, Mac’dagi server orqali (`UIC_Igov` Wi‑Fi telefon va Linux serverni bir-biridan ajratadi: ARP `FAILED`, Linux power save o‘chirilgandan keyin ham). Telefon kamerasi simulyatorda ko‘rindi.
+
+* Telefon videosi qabul qiluvchilarda yonboshlab ko‘rinardi. Sabab: kamera kadrlari burilmagan holda, burilish esa RTP `urn:3gpp:video-orientation` kengaytmasida yuboriladi; server kadrlarni qayta paketlaganda bu qiymatni tashlab yuborardi. **Tuzatildi:** har trekning oxirgi orientatsiyasi saqlanadi va har uzatilgan kadrga yoziladi (o‘rtadan qo‘shilgan qabul qiluvchilar uchun ham).
+
 Sinov paytida topilgan va tuzatilgan muammolar:
 
 * macOS (va iOS qurilmalar) LAN’dagi serverga **Local Network** ruxsatisiz ulana olmaydi (`No route to host`, errno 65). Ilovalarga `NSLocalNetworkUsageDescription` qo‘shildi.

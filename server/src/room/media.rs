@@ -301,6 +301,7 @@ impl Room {
                     muted: offered.muted,
                     layers,
                     last_keyframe_request: None,
+                    orientation: None,
                 };
                 kept.insert(track.id.clone());
                 added.push(track.id.clone());
@@ -746,10 +747,13 @@ impl Room {
             .media_in_total
             .fetch_add(1, Ordering::Relaxed);
         let publisher = &mut self.participants[index];
-        let Some(track) = publisher.tracks.iter().find(|t| t.mid == data.mid) else {
+        let Some(track) = publisher.tracks.iter_mut().find(|t| t.mid == data.mid) else {
             return;
         };
-        let (track_id, kind) = (track.id.clone(), track.kind);
+        if data.ext_vals.video_orientation.is_some() {
+            track.orientation = data.ext_vals.video_orientation;
+        }
+        let (track_id, kind, orientation) = (track.id.clone(), track.kind, track.orientation);
         let publisher_id = publisher.id.clone();
 
         let mut audio_level = None;
@@ -805,6 +809,9 @@ impl Room {
             };
             if let Some((level, voice)) = audio_level {
                 writer = writer.audio_level(level, voice);
+            }
+            if let Some(orientation) = orientation {
+                writer = writer.video_orientation(orientation);
             }
             match writer.write(pt, data.network_time, time, data.data.clone()) {
                 Ok(()) => {
