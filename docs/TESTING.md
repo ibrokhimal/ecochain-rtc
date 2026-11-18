@@ -77,6 +77,20 @@ Ikkala qurilma bitta iPhone hotspot’ida: trafik Mac → iPhone → Linux yo‘
 
 Video bilan bot sinovlari bu tarmoqda o‘lchov emas: har bot simulcast’da ~2,15 Mbit/s yuboradi (BWE’ga moslashmaydi), bu hotspot sig‘imidan katta. Botlar audio 5–75% oladi, server esa yuklama ostida emas (loopback’da xuddi shu yuklama 100%). Haqiqiy klientlar TWCC/BWE bilan sifatni pasaytiradi. Yuklama sinovini router orqali LAN’da yoki kabelda o‘tkazish kerak. Linux’da power save’ni o‘chirish tavsiya etiladi (`sudo iwconfig wlp0s20f3 power off` yoki NetworkManager’da `wifi.powersave = 2`).
 
+Boshqa Wi‑Fi’da (router, server `172.16.137.58`, Mac `172.16.137.69`, ping 6–151 ms, 0% yo‘qotish), botlar Mac → Linux, 15 s:
+
+| Bot / video | Audio | Video | Qabul, kbit/s (har bot) |
+| --- | --- | --- | --- |
+| 2 / 0 | 99% | — | 32 |
+| 2 / 1 | 100% | 100% | 1 563 |
+| 4 / 3 | 100% | 100% | 3 571 |
+| 6 / 4 | 100% | 100% | 5 598 |
+| 10 / 4 | 100% | 98% | 5 671 (jami ~57 Mbit/s) |
+
+`send_error` va `send_queue_full` 0. Demak hotspot’dagi yo‘qotish tarmoq sig‘imi edi, server emas.
+
+Tarmoq almashganda: media socket IP’si faqat ishga tushishda aniqlanadi, shuning uchun server yangi Wi‑Fi’da **qayta ishga tushirilishi kerak** (aks holda signaling ishlaydi, lekin media eski IP’ga e’lon qilinadi). Yangi IP: serverda `hostname -I`.
+
 Sinov paytida topilgan va tuzatilgan muammolar:
 
 * macOS (va iOS qurilmalar) LAN’dagi serverga **Local Network** ruxsatisiz ulana olmaydi (`No route to host`, errno 65). Ilovalarga `NSLocalNetworkUsageDescription` qo‘shildi.
