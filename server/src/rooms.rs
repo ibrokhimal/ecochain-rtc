@@ -27,7 +27,8 @@ pub struct Rooms {
     /// `(room id, identity)` pairs removed by a host. Kept here rather than
     /// in the room task so the ban survives the room closing when empty and
     /// being created again on the next join.
-    removed: Mutex<HashMap<(String, String), Instant>>,
+    /// Value: unix time until which the ban holds.
+    removed: Mutex<HashMap<(String, String), u64>>,
 }
 
 impl Rooms {
@@ -140,24 +141,26 @@ impl Rooms {
 
     /// Remembers that the host removed `identity` from `room_id`.
     ///
-    /// Kept for `rooms.ended_room_memory_secs` (default 24 h); room tokens
-    /// should be issued with a shorter lifetime than that.
-    pub fn mark_removed(&self, room_id: &str, identity: &str) {
-        let keep = Duration::from_secs(self.config.rooms.ended_room_memory_secs);
+    /// `token_exp` is the latest `exp` of the removed session's tokens; see
+    /// [`ban_until`] for how long the ban lasts.
+    pub fn mark_removed(&self, room_id: &str, identity: &str, token_exp: u64) {
+        let now = crate::auth::unix_now();
+        let until = ban_until(token_exp, now, self.config.rooms.removal_memory_secs);
         let mut removed = self.removed.lock().expect("rooms lock");
-        let now = Instant::now();
-        removed.retain(|_, at| now - *at < keep);
-        removed.insert((room_id.to_owned(), identity.to_owned()), now);
+        removed.retain(|_, until| *until >= now);
+        let entry = removed
+            .entry((room_id.to_owned(), identity.to_owned()))
+            .or_default();
+        *entry = (*entry).max(until);
     }
 
-    /// Whether the host removed `identity` from `room_id` recently.
+    /// Whether `identity` is currently banned from `room_id`.
     pub fn is_removed(&self, room_id: &str, identity: &str) -> bool {
-        let keep = Duration::from_secs(self.config.rooms.ended_room_memory_secs);
         self.removed
             .lock()
             .expect("rooms lock")
             .get(&(room_id.to_owned(), identity.to_owned()))
-            .is_some_and(|at| at.elapsed() < keep)
+            .is_some_and(|until| *until >= crate::auth::unix_now())
     }
 
     /// Whether `room_id` was ended recently.
@@ -168,5 +171,27 @@ impl Rooms {
             .expect("rooms lock")
             .get(room_id)
             .is_some_and(|at| at.elapsed() < keep)
+    }
+}
+
+/// Unix time until which a host removal holds: never before the removed
+/// token stops verifying (`exp` plus allowed clock skew), and at least
+/// `memory_secs` from now so a freshly issued token is refused as well.
+pub fn ban_until(token_exp: u64, now: u64, memory_secs: u64) -> u64 {
+    (token_exp + crate::auth::CLOCK_SKEW_SECS).max(now + memory_secs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ban_until;
+
+    #[test]
+    fn ban_outlives_long_tokens() {
+        let now = 1_000_000;
+        let week = 7 * 24 * 3600;
+        // A token valid for a week keeps the ban for that week, not 24 h.
+        assert_eq!(ban_until(now + week, now, 24 * 3600), now + week + 30);
+        // Short tokens still get the minimum memory.
+        assert_eq!(ban_until(now + 60, now, 24 * 3600), now + 24 * 3600);
     }
 }

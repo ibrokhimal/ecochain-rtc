@@ -132,6 +132,10 @@ pub struct RoomsConfig {
     /// How long the id of an ended room is remembered, so that late retries
     /// receive `room_ended` instead of silently creating a new room.
     pub ended_room_memory_secs: u64,
+    /// Minimum time a host removal blocks the identity from the room. The
+    /// ban always lasts at least until the removed participant's token
+    /// expires; this extends it for tokens the backend issues later.
+    pub removal_memory_secs: u64,
 }
 
 impl Default for RoomsConfig {
@@ -144,6 +148,7 @@ impl Default for RoomsConfig {
             reconnect_grace_secs: 30,
             empty_room_ttl_secs: 60,
             ended_room_memory_secs: 24 * 3600,
+            removal_memory_secs: 24 * 3600,
         }
     }
 }

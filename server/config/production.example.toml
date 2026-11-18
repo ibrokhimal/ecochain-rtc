@@ -20,6 +20,7 @@ max_participants_limit = 100
 max_video_subscriptions = 9
 reconnect_grace_secs = 30
 empty_room_ttl_secs = 60
+removal_memory_secs = 86400   # host removal lasts at least this long (and until the removed token expires)
 
 [media]
 udp_port = 7882

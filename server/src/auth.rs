@@ -21,7 +21,7 @@ type HmacSha256 = Hmac<Sha256>;
 pub const MAX_TOKEN_LEN: usize = 4096;
 
 /// Maximum clock difference tolerated between the issuer and this server.
-const CLOCK_SKEW_SECS: u64 = 30;
+pub const CLOCK_SKEW_SECS: u64 = 30;
 
 /// Participant role inside a room.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

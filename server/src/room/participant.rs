@@ -229,6 +229,9 @@ pub struct Participant {
     pub role: Role,
     /// May publish media.
     pub can_publish: bool,
+    /// Latest `exp` of the tokens this session joined with. A host removal
+    /// must outlive it, or the token could simply be reused.
+    pub token_exp: u64,
     /// Secret id the client presents to resume this session.
     pub session_id: String,
     /// Attached socket. `None` while waiting for a resume.
@@ -262,6 +265,7 @@ impl Participant {
             name: claims.name.clone().unwrap_or_else(|| claims.sub.clone()),
             role: claims.role,
             can_publish: claims.can_publish,
+            token_exp: claims.exp,
             session_id,
             conn: Some(conn),
             disconnected_at: None,

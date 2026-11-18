@@ -96,7 +96,7 @@ JWT, `alg: HS256`. Tokenni Ecochain backend’i (masalan, Messenger) chiqaradi; 
 | `track.mute` | `source`, `muted` | `{}` | trek egasi |
 | `subscription.update` | `changes[]: {track_id, subscribed, quality?}` | `{}` | hamma |
 | `room.end` | – | `{}`, keyin hammaga `room.ended` + `4004` | `host` |
-| `participant.remove` | `participant_id` | `{}`; shu identity bu xonaga `ended_room_memory_secs` (24 soat) davomida, xona qayta yaratilsa ham, kira olmaydi (`forbidden`) | `host` |
+| `participant.remove` | `participant_id` | `{}`; shu identity bu xonaga, xona qayta yaratilsa ham, kira olmaydi (`forbidden`): chiqarilgan sessiya tokenlarining eng kech `exp`i (+30 s) yoki `removal_memory_secs` (standart 24 soat) — qaysi biri keyinroq bo‘lsa, shu vaqtgacha | `host` |
 
 `join` javobi:
 

@@ -347,6 +347,7 @@ impl Room {
                 participant.name = claims.name.clone().unwrap_or_else(|| claims.sub.clone());
                 participant.role = claims.role;
                 participant.can_publish = claims.can_publish;
+                participant.token_exp = participant.token_exp.max(claims.exp);
                 self.services
                     .metrics
                     .resumes_total
@@ -439,7 +440,11 @@ impl Room {
             });
         }
         let id = participant.id.clone();
+        let previous_exp = participant.token_exp;
         *participant = Participant::new(id, claims, random_id("SE_"), conn.clone());
+        // The older token of this identity may still be valid; a later
+        // removal must cover it too.
+        participant.token_exp = participant.token_exp.max(previous_exp);
         let info = participant.info();
         self.broadcast_except(
             index,
@@ -515,7 +520,11 @@ impl Room {
             After::Remove(target) => {
                 if let Some(target) = self.participants.iter().position(|p| p.id == target) {
                     if let Some(rooms) = self.services.rooms.upgrade() {
-                        rooms.mark_removed(&self.id, &self.participants[target].identity);
+                        rooms.mark_removed(
+                            &self.id,
+                            &self.participants[target].identity,
+                            self.participants[target].token_exp,
+                        );
                     }
                     let participant = &self.participants[target];
                     participant.send(Outbound::event(
