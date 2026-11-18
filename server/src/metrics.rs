@@ -30,12 +30,55 @@ pub struct Metrics {
     pub media_in_total: AtomicU64,
     /// RTP media units written to subscribers.
     pub media_out_total: AtomicU64,
-    /// UDP datagrams dropped because a room queue was full or no peer matched.
-    pub udp_dropped_total: AtomicU64,
+    /// Dropped UDP datagrams, by [`UdpDrop`] reason.
+    udp_dropped: [AtomicU64; UdpDrop::ALL.len()],
     join_failures: Mutex<BTreeMap<&'static str, u64>>,
 }
 
+/// Why a UDP datagram was dropped. Separate counters tell congestion on the
+/// server (`send_queue_full`, `room_queue_full`, `send_error`) apart from
+/// harmless stray packets (`unrouted`, `no_peer`), for example from clients
+/// that keep sending for a moment after they left.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UdpDrop {
+    /// The sender thread's queue was full.
+    SendQueueFull,
+    /// `sendto` failed, also after one retry (kernel buffer full, no route).
+    SendError,
+    /// Received from an unknown address without a known STUN username.
+    Unrouted,
+    /// The room task's inbound queue was full.
+    RoomQueueFull,
+    /// Routed to a room, but no peer of that room accepted it.
+    NoPeer,
+}
+
+impl UdpDrop {
+    const ALL: [UdpDrop; 5] = [
+        UdpDrop::SendQueueFull,
+        UdpDrop::SendError,
+        UdpDrop::Unrouted,
+        UdpDrop::RoomQueueFull,
+        UdpDrop::NoPeer,
+    ];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            UdpDrop::SendQueueFull => "send_queue_full",
+            UdpDrop::SendError => "send_error",
+            UdpDrop::Unrouted => "unrouted",
+            UdpDrop::RoomQueueFull => "room_queue_full",
+            UdpDrop::NoPeer => "no_peer",
+        }
+    }
+}
+
 impl Metrics {
+    /// Counts one dropped UDP datagram.
+    pub fn udp_dropped(&self, reason: UdpDrop) {
+        self.udp_dropped[reason as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Counts a rejected join by error code.
     pub fn join_failed(&self, code: crate::protocol::ErrorCode) {
         let mut map = self.join_failures.lock().expect("metrics lock");
@@ -112,12 +155,18 @@ impl Metrics {
             "Media units forwarded to subscribers.",
             load(&self.media_out_total),
         );
-        counter(
-            &mut out,
-            "ecochain_rtc_udp_dropped_total",
-            "Dropped UDP datagrams.",
-            load(&self.udp_dropped_total),
+        let _ = writeln!(
+            out,
+            "# HELP ecochain_rtc_udp_dropped_total Dropped UDP datagrams by reason.\n# TYPE ecochain_rtc_udp_dropped_total counter"
         );
+        for reason in UdpDrop::ALL {
+            let _ = writeln!(
+                out,
+                "ecochain_rtc_udp_dropped_total{{reason=\"{}\"}} {}",
+                reason.as_str(),
+                load(&self.udp_dropped[reason as usize]),
+            );
+        }
         let _ = writeln!(
             out,
             "# HELP ecochain_rtc_join_failures_total Rejected joins by error code.\n# TYPE ecochain_rtc_join_failures_total counter"

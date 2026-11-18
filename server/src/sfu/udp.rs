@@ -15,11 +15,11 @@
 //! Because a network switch (Wi-Fi to mobile) always starts with new STUN
 //! checks from the new address, rule 2 also handles roaming.
 
-use crate::metrics::Metrics;
+use crate::metrics::{Metrics, UdpDrop};
 use std::{
     collections::HashMap,
     net::{IpAddr, SocketAddr},
-    sync::{atomic::Ordering, Arc, Mutex},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 use tokio::{net::UdpSocket, sync::mpsc};
@@ -84,9 +84,22 @@ impl MediaSockets {
             let std_socket = std::net::UdpSocket::bind(bind)
                 .map_err(|e| anyhow::anyhow!("cannot bind media socket {bind}: {e}"))?;
             std_socket.set_nonblocking(true)?;
+            // Wi-Fi links stall for tens of milliseconds (power save,
+            // retries). The default ~200 KB send buffer then fills and every
+            // further datagram fails with EAGAIN; a larger one rides it out.
+            // The kernel caps the value at net.core.{w,r}mem_max.
+            let sock = socket2::SockRef::from(&std_socket);
+            let _ = sock.set_send_buffer_size(SOCKET_BUFFER);
+            let _ = sock.set_recv_buffer_size(SOCKET_BUFFER);
             let local = std_socket.local_addr()?;
             let advertised = SocketAddr::new(advertise_ip.unwrap_or(local.ip()), local.port());
-            tracing::info!(%local, %advertised, "media socket bound");
+            tracing::info!(
+                %local,
+                %advertised,
+                send_buffer = sock.send_buffer_size().unwrap_or(0),
+                recv_buffer = sock.recv_buffer_size().unwrap_or(0),
+                "media socket bound"
+            );
             let (queue, outgoing) = std::sync::mpsc::sync_channel(SEND_QUEUE);
             let sender = std_socket.try_clone()?;
             let send_metrics = metrics.clone();
@@ -140,10 +153,13 @@ impl MediaSockets {
         let Some((_, queue)) = self.sockets.iter().find(|(addr, _)| *addr == source) else {
             return;
         };
+        // ICE pairs every local candidate with every remote one. A loopback
+        // socket can never reach another host (EINVAL); skip those checks.
+        if source.ip().is_loopback() && !destination.ip().is_loopback() {
+            return;
+        }
         if queue.try_send((destination, data.to_vec())).is_err() {
-            self.metrics
-                .udp_dropped_total
-                .fetch_add(1, Ordering::Relaxed);
+            self.metrics.udp_dropped(UdpDrop::SendQueueFull);
         }
     }
 
@@ -161,9 +177,7 @@ impl MediaSockets {
             };
             let data = &buf[..len];
             let Some(room) = self.route(source, data) else {
-                self.metrics
-                    .udp_dropped_total
-                    .fetch_add(1, Ordering::Relaxed);
+                self.metrics.udp_dropped(UdpDrop::Unrouted);
                 continue;
             };
             let datagram = Datagram {
@@ -173,9 +187,7 @@ impl MediaSockets {
                 received: Instant::now(),
             };
             if room.try_send(datagram).is_err() {
-                self.metrics
-                    .udp_dropped_total
-                    .fetch_add(1, Ordering::Relaxed);
+                self.metrics.udp_dropped(UdpDrop::RoomQueueFull);
             }
         }
     }
@@ -210,6 +222,9 @@ impl MediaSockets {
     }
 }
 
+/// Requested kernel send and receive buffer of each media socket (4 MiB).
+const SOCKET_BUFFER: usize = 4 << 20;
+
 /// Sender thread body. The socket is non-blocking (shared with the tokio
 /// receiver); on a full kernel buffer it waits briefly and retries once.
 fn send_loop(
@@ -217,14 +232,22 @@ fn send_loop(
     outgoing: std::sync::mpsc::Receiver<(SocketAddr, Vec<u8>)>,
     metrics: Arc<Metrics>,
 ) {
+    let local = socket.local_addr().ok();
+    let mut failures: u64 = 0;
     while let Ok((destination, data)) = outgoing.recv() {
         let mut sent = socket.send_to(&data, destination);
         if matches!(&sent, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock) {
             std::thread::sleep(Duration::from_micros(200));
             sent = socket.send_to(&data, destination);
         }
-        if sent.is_err() {
-            metrics.udp_dropped_total.fetch_add(1, Ordering::Relaxed);
+        if let Err(e) = sent {
+            metrics.udp_dropped(UdpDrop::SendError);
+            // The first failure and then every 10 000th: enough to see the
+            // cause without flooding the log. Addresses are not secrets.
+            if failures.is_multiple_of(10_000) {
+                tracing::warn!(error = %e, ?local, %destination, len = data.len(), failures, "udp send failed");
+            }
+            failures += 1;
         }
     }
 }

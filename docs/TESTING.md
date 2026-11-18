@@ -66,6 +66,17 @@ Server: Ubuntu 24.04, x86_64, 16 yadro, Wi‑Fi `172.20.10.3` (iPhone hotspot). 
 | Audio ikki yo‘nalishda | kirish 100/s, chiqish 100/s (har biri ikkinchisining audiosini oladi) |
 | Server 5 s o‘chirib yoqildi | ikkala ilova o‘zi qayta ulandi, media **7,5 s** da tiklandi |
 
+### Wi‑Fi orqali yuklama va UDP yo‘qotishi
+
+Ikkala qurilma bitta iPhone hotspot’ida: trafik Mac → iPhone → Linux yo‘lidan o‘tadi. O‘lchangan o‘tkazuvchanlik (10 MB `scp`): Linux → Mac **2,1 Mbit/s**, Mac → Linux **4,1 Mbit/s**; ping 6–560 ms, Linux → Mac 15% yo‘qotish. Linux’da Wi‑Fi power management yoqilgan (`iwconfig`: `Power Management:on`).
+
+`ecochain_rtc_udp_dropped_total` endi sabab bo‘yicha ajratilgan (`send_queue_full`, `send_error`, `unrouted`, `room_queue_full`, `no_peer`). Oldingi o‘sish (5471 gacha) deyarli butunlay `send_error` edi:
+
+* `EAGAIN` (os 11): Wi‑Fi qisqa to‘xtaganda ~200 KB lik standart socket yuborish buferi to‘lib, keyingi paketlar tashlanardi. **Tuzatildi:** media socket’lar 4 MiB bufer so‘raydi (kernel `net.core.wmem_max` gacha cheklaydi). Faqat audio, 2 bot: yetkazish **43% → 100%**, `send_error` 0.
+* `EINVAL` (os 22): ICE loopback socket’idan LAN manzilga tekshiruv yuborardi. Endi bunday juftliklar o‘tkazib yuboriladi.
+
+Video bilan bot sinovlari bu tarmoqda o‘lchov emas: har bot simulcast’da ~2,15 Mbit/s yuboradi (BWE’ga moslashmaydi), bu hotspot sig‘imidan katta. Botlar audio 5–75% oladi, server esa yuklama ostida emas (loopback’da xuddi shu yuklama 100%). Haqiqiy klientlar TWCC/BWE bilan sifatni pasaytiradi. Yuklama sinovini router orqali LAN’da yoki kabelda o‘tkazish kerak. Linux’da power save’ni o‘chirish tavsiya etiladi (`sudo iw dev wlp0s20f3 set power_save off` yoki NetworkManager’da `wifi.powersave = 2`).
+
 Sinov paytida topilgan va tuzatilgan muammolar:
 
 * macOS (va iOS qurilmalar) LAN’dagi serverga **Local Network** ruxsatisiz ulana olmaydi (`No route to host`, errno 65). Ilovalarga `NSLocalNetworkUsageDescription` qo‘shildi.

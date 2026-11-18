@@ -91,8 +91,7 @@ impl Room {
         }
         self.services
             .metrics
-            .udp_dropped_total
-            .fetch_add(1, Ordering::Relaxed);
+            .udp_dropped(crate::metrics::UdpDrop::NoPeer);
     }
 
     /// Advances all peers, sends their datagrams and processes their events
