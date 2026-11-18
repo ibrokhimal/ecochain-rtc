@@ -32,5 +32,7 @@
 	<string>Uchrashuvda video ko‘rsatish uchun kamera kerak.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Uchrashuvda gapirish uchun mikrofon kerak.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Lokal tarmoqdagi uchrashuv serveriga ulanish uchun kerak.</string>
 </dict>
 </plist>

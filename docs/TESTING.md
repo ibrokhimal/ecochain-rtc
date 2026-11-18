@@ -53,6 +53,26 @@ Haqiqiy Rust server (`config/development.toml`, release build):
 
 Ikkala mikrofon bitta Mac’dan foydalangani uchun audioni quloq bilan baholash o‘tkazilmadi; audio uzatilishi server hisoblagichlari bilan tasdiqlandi.
 
+## Linux server, Wi‑Fi orqali (2026-11-18)
+
+Server: Ubuntu 24.04, x86_64, 16 yadro, Wi‑Fi `172.20.10.3` (iPhone hotspot). Klientlar: Mac `172.20.10.14` (macOS Meet + iOS Simulator Messenger).
+
+| Tekshiruv | Natija |
+| --- | --- |
+| `cargo test` Linux’da | 37/37 ✅ |
+| Release build | 1 daq 51 s; server RSS ~18 MB, 2 ishtirokchida CPU ~2% |
+| 2 bot Mac → Linux, Wi‑Fi | audio 100%, video 100% |
+| macOS Meet → iOS Messenger | Alice kamera videosi Bob ekranida ko‘rindi |
+| Audio ikki yo‘nalishda | kirish 100/s, chiqish 100/s (har biri ikkinchisining audiosini oladi) |
+| Server 5 s o‘chirib yoqildi | ikkala ilova o‘zi qayta ulandi, media **7,5 s** da tiklandi |
+
+Sinov paytida topilgan va tuzatilgan muammolar:
+
+* macOS (va iOS qurilmalar) LAN’dagi serverga **Local Network** ruxsatisiz ulana olmaydi (`No route to host`, errno 65). Ilovalarga `NSLocalNetworkUsageDescription` qo‘shildi.
+* Ulanishdan keyin kamera ochilmasa (`NotAllowedError`), xato faqat `lastError`da qolib, ekranda ko‘rinmas edi. Endi Meet ekranida qizil banner va logda xabar chiqadi.
+* macOS’da ruxsat oynasi ochiq turganda Flutter UI thread bloklanadi, heartbeat to‘xtaydi va server socket’ni yopadi. Sessiya resume bilan tiklandi. Bitta holatda shundan keyin Alice Bob’ning audiosini olmadi; Alice qayta ulangach muammo yo‘qoldi. Sababi hali aniqlanmagan (ochiq masala).
+* Debug build har safar qayta yig‘ilganda macOS kamera ruxsatini yangi binary uchun qayta so‘raydi yoki rad etadi. Imzolangan release build’da bu muammo yo‘q.
+
 ## Yuklama sinovi (25 ishtirokchi)
 
 ```bash

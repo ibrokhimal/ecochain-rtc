@@ -373,17 +373,22 @@ class RtcSession extends ChangeNotifier {
     return _media.run(() async {
       if (!_alive(generation) || _state == RtcConnectionState.connecting) return;
       await _applySource(source, generation);
+      _lastError = null;
       _notify();
     });
   }
 
   /// Applies all remembered device choices (after join or rejoin).
   Future<void> _applyLocalMedia(int generation) => _media.run(() async {
+    _lastError = null;
     for (final source in RtcTrackSource.values) {
       if (!_alive(generation)) return;
       try {
         await _applySource(source, generation);
       } on RtcException catch (e) {
+        // Joining succeeded; a device problem must not end the call, but it
+        // must be visible (UI banner via lastError, and the log).
+        debugPrint('ecochain_rtc: ${e.message}');
         _lastError = e;
       }
     }
@@ -469,7 +474,9 @@ class RtcSession extends ChangeNotifier {
       final denied = text.contains('permission') || text.contains('notallowed') || text.contains('denied');
       throw RtcException(
         denied ? RtcErrorCode.permissionDenied : RtcErrorCode.deviceError,
-        'cannot open ${source.name}: ${e.runtimeType}',
+        // Device errors carry no secrets; the text is what explains the
+        // failure (busy device, missing hardware, denied permission).
+        'cannot open ${source.name}: $e',
       );
     }
   }

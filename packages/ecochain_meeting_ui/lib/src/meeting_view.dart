@@ -171,7 +171,12 @@ class _StatusBanner extends StatelessWidget {
       RtcConnectionState.connecting => (Colors.blueGrey, MeetingStrings.state(state)),
       RtcConnectionState.reconnecting => (Colors.orange.shade800, MeetingStrings.state(state)),
       RtcConnectionState.disconnected => (Colors.red.shade800, MeetingStrings.state(state)),
-      _ => (null, notice),
+      _ => switch (session.lastError) {
+        // A device that failed to open is shown until the next successful
+        // toggle, so a silently missing camera is never a mystery.
+        final error? when notice == null => (Colors.red.shade900, MeetingStrings.error(error.code)),
+        _ => (null, notice),
+      },
     };
     if (text == null) return const SizedBox(height: 4);
     return Container(

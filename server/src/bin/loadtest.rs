@@ -40,6 +40,10 @@ struct Args {
     /// Room id.
     #[arg(long, default_value = "loadtest")]
     room: String,
+    /// Local IP the bots bind their UDP sockets to. Use the LAN address
+    /// when the server runs on another machine.
+    #[arg(long, default_value = "127.0.0.1")]
+    bind_ip: std::net::IpAddr,
 }
 
 #[tokio::main]
@@ -68,7 +72,7 @@ async fn main() -> anyhow::Result<()> {
         let options = BotOptions {
             url: args.url.clone(),
             token: auth::issue(&claims, &config.auth.token_secret),
-            bind_ip: "127.0.0.1".parse()?,
+            bind_ip: args.bind_ip,
             audio: true,
             video_kbps: Some(500),
             simulcast: true,

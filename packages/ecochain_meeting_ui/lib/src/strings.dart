@@ -73,6 +73,7 @@ abstract final class MeetingStrings {
   /// Message for an error code.
   static String error(RtcErrorCode code) => switch (code) {
     RtcErrorCode.permissionDenied => 'Mikrofon yoki kameraga ruxsat berilmagan.',
+    RtcErrorCode.deviceError => 'Kamera yoki mikrofonni ochib bo‘lmadi (band yoki mavjud emas).',
     RtcErrorCode.invalidUrl => 'Server manzili noto‘g‘ri. wss:// manzil kiriting.',
     RtcErrorCode.roomFull => 'Xona to‘lgan.',
     RtcErrorCode.roomEnded => 'Uchrashuv yakunlangan.',
