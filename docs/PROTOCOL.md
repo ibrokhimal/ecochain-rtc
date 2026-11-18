@@ -96,7 +96,7 @@ JWT, `alg: HS256`. Tokenni Ecochain backend’i (masalan, Messenger) chiqaradi; 
 | `track.mute` | `source`, `muted` | `{}` | trek egasi |
 | `subscription.update` | `changes[]: {track_id, subscribed, quality?}` | `{}` | hamma |
 | `room.end` | – | `{}`, keyin hammaga `room.ended` + `4004` | `host` |
-| `participant.remove` | `participant_id` | `{}` | `host` |
+| `participant.remove` | `participant_id` | `{}`; shu identity xona yopilguncha qayta kira olmaydi (`forbidden`) | `host` |
 
 `join` javobi:
 
@@ -142,7 +142,7 @@ Yo‘nalishlar ajratilgani uchun “glare” (ikki tomon bir vaqtda offer qilish
 
 **Obunalar:** boshqa ishtirokchilarning audiolari avtomatik keladi (`subscription.update`da `subscribed:false` bilan o‘chirish mumkin). Video va ekran faqat `subscription.update` orqali, `max_video_subscriptions` limiti bilan. `quality`: `low | medium | high`.
 
-**ICE:** server SDP’da host kandidatlarini beradi; klient kandidatlarini `ice.candidate` bilan yuborishi ixtiyoriy (server peer-reflexive manzilni STUN’dan ham biladi). Publisher ICE restart — `createOffer({iceRestart:true})` + `publisher.offer`. Subscriber ICE restart — `ice.restart`. To‘liq media reconnect — `publisher.offer` `reset:true` va `subscriber.reset`.
+**ICE:** server SDP’da host kandidatlarini beradi; klient kandidatlarini `ice.candidate` bilan yuborishi ixtiyoriy (server peer-reflexive manzilni STUN’dan ham biladi). Server faqat UDP kandidatlarini qabul qiladi; unspecified, multicast, broadcast manzillar va production’da loopback/xususiy/link-local manzillar rad etiladi (`added:false`), har peer uchun ko‘pi bilan 32 ta. Bu serverni ixtiyoriy manzilga STUN yuborishga majburlashning (SSRF) oldini oladi. Publisher ICE restart — `createOffer({iceRestart:true})` + `publisher.offer`. Subscriber ICE restart — `ice.restart`. To‘liq media reconnect — `publisher.offer` `reset:true` va `subscriber.reset`.
 
 ## 9. Misol oqim
 

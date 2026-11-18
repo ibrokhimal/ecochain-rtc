@@ -355,6 +355,17 @@ async fn host_can_remove_participant_and_duplicate_requests_are_not_repeated() {
     assert_eq!(guest.wait_closed(WAIT).await, Some(4005));
     let left = host.wait_event("participant.left", WAIT).await.unwrap();
     assert_eq!(left["data"]["reason"], "removed");
+
+    // The guest's token is still valid, but the room remembers the removal.
+    let mut again = server.signal().await;
+    let error = again
+        .request(
+            "join",
+            json!({"token": server.token("kick", "guest", Role::Participant)}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Some(ErrorCode::Forbidden));
 }
 
 #[tokio::test]

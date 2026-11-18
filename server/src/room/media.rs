@@ -448,19 +448,14 @@ impl Room {
             PeerTarget::Publisher => PeerKind::Publisher,
             PeerTarget::Subscriber => PeerKind::Subscriber,
         };
+        let allow_private = self.services.config.mode == crate::config::Mode::Development;
         let peer = self
             .peer_mut(index, kind)
             .ok_or_else(|| ProtocolError::new(ErrorCode::InvalidState, "peer does not exist"))?;
-        // Unparseable candidates (for example mDNS `.local` names) are
-        // ignored: the server learns peer-reflexive addresses from STUN.
-        match parse_candidate(line) {
-            Some(candidate) => {
-                peer.rtc.add_remote_candidate(candidate);
-                peer.wake(Instant::now());
-                Ok(true)
-            }
-            None => Ok(false),
-        }
+        // Unparseable (for example mDNS `.local`), internal-network and
+        // excess candidates are ignored: the server still learns the
+        // client's real address from its STUN requests (peer-reflexive).
+        Ok(parse_candidate(line).is_some_and(|c| peer.add_remote_candidate(c, allow_private)))
     }
 
     pub(super) fn ice_restart(
