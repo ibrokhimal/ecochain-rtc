@@ -447,3 +447,44 @@ async fn unanswered_offer_is_resent_unchanged() {
     );
     bob.leave().await;
 }
+
+#[tokio::test]
+async fn reused_request_id_after_resume_runs_the_new_request() {
+    let server = common::start("").await;
+    let token = server.token("reuse", "host", Role::Host);
+    let mut host = server.signal().await;
+    let joined = host.request("join", json!({"token": token})).await.unwrap();
+    let session = joined["session_id"].as_str().unwrap().to_owned();
+
+    let mut guests = Vec::new();
+    for name in ["g1", "g2"] {
+        let mut guest = server.signal().await;
+        let joined = guest
+            .request(
+                "join",
+                json!({"token": server.token("reuse", name, Role::Participant)}),
+            )
+            .await
+            .unwrap();
+        guests.push((guest, joined["participant"]["participant_id"].clone()));
+    }
+    let (mut g1, g1_id) = guests.remove(0);
+    let (mut g2, g2_id) = guests.remove(0);
+
+    host.request_with_id("r2", "participant.remove", json!({"participant_id": g1_id}))
+        .await
+        .unwrap();
+    g1.wait_event("removed", WAIT).await.unwrap();
+
+    // A client whose id counter restarts on the new socket sends "r2" again,
+    // for a different request. It must run, not get the cached answer.
+    host.drop_connection().await;
+    let mut host = server.signal().await;
+    host.request("join", json!({"token": token, "resume_session_id": session}))
+        .await
+        .unwrap();
+    host.request_with_id("r2", "participant.remove", json!({"participant_id": g2_id}))
+        .await
+        .unwrap();
+    g2.wait_event("removed", WAIT).await.unwrap();
+}

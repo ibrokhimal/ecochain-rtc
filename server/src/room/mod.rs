@@ -484,14 +484,15 @@ impl Room {
             return;
         };
 
-        if request.needs_dedup() {
-            if let Some(cached) = self.participants[index].responses.get(&request_id) {
+        let dedup = request.needs_dedup();
+        let fingerprint = if dedup { request_fingerprint(&request) } else { 0 };
+        if dedup {
+            if let Some(cached) = self.participants[index].responses.get(&request_id, fingerprint) {
                 conn.send(response(&request_id, cached.clone()));
                 return;
             }
         }
 
-        let dedup = request.needs_dedup();
         let result = self.execute(index, request);
         let (result, after) = match result {
             Ok((data, after)) => (Ok(data), after),
@@ -500,7 +501,7 @@ impl Room {
         if dedup {
             self.participants[index]
                 .responses
-                .put(request_id.clone(), result.clone());
+                .put(request_id.clone(), fingerprint, result.clone());
         }
         conn.send(response(&request_id, result));
 
@@ -733,4 +734,13 @@ pub(crate) fn random_id(prefix: &str) -> String {
         .map(char::from)
         .collect();
     format!("{prefix}{suffix}")
+}
+
+/// Content hash of a request, so a retried request (same id, same content)
+/// is recognised and a reused id with other content is not.
+fn request_fingerprint(request: &SessionRequest) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    format!("{request:?}").hash(&mut hasher);
+    hasher.finish()
 }

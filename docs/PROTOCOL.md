@@ -21,6 +21,8 @@ Rust’dagi aniq turlar: [`server/src/protocol.rs`](../server/src/protocol.rs). 
 
 Server har bir sessiya uchun oxirgi 64 ta so‘rovning natijasini `id` bo‘yicha saqlaydi (`ping`dan tashqari). Bir xil `id` bilan qayta yuborilgan so‘rov qayta bajarilmaydi — birinchi natija qaytariladi. Bu reconnect’dan keyin javobi kelmay qolgan so‘rovni xavfsiz takrorlash imkonini beradi (masalan, `participant.remove`ning ikkinchi marta bajarilishi “unknown participant” xatosiga aylanmaydi).
 
+Kesh resume’dan keyin ham saqlanadi, shuning uchun `id` butun sessiya davomida noyob bo‘lishi kerak: yangi socket’da hisoblagichni `r1`dan qayta boshlamang (SDK har socket uchun tasodifiy prefiks ishlatadi). Server natijani `id` va so‘rov mazmuni bo‘yicha taqqoslaydi: bir xil `id`, lekin boshqa mazmundagi so‘rov keshdagi javobni olmaydi, balki qayta bajariladi.
+
 Bitta socket’dagi so‘rovlar qat’iy ketma-ketlikda bajariladi; bir xonadagi barcha so‘rovlar bitta xona aktori ichida navbat bilan qayta ishlanadi. Shuning uchun parallel join, chiqish va reconnect poygasi deterministik hal bo‘ladi.
 
 ## 2. Xato kodlari

@@ -196,24 +196,34 @@ impl Subscriber {
     }
 }
 
-/// Answers to recent requests, keyed by request id.
+/// Answers to recent requests, keyed by request id and content.
+///
+/// The content fingerprint keeps a reused id from returning the answer of a
+/// different request: a client that restarts its id counter on a new socket
+/// would otherwise get a stale `ok` for a request that never ran.
 #[derive(Debug, Default)]
 pub struct ResponseCache {
-    entries: VecDeque<(String, Result<Value, ProtocolError>)>,
+    entries: VecDeque<(String, u64, Result<Value, ProtocolError>)>,
 }
 
 impl ResponseCache {
-    /// Cached result for `id`, if the request was already executed.
-    pub fn get(&self, id: &str) -> Option<&Result<Value, ProtocolError>> {
-        self.entries.iter().find(|(k, _)| k == id).map(|(_, v)| v)
+    /// Cached result for `id`, if the same request was already executed.
+    /// `None` also when the id is known but `fingerprint` differs.
+    pub fn get(&self, id: &str, fingerprint: u64) -> Option<&Result<Value, ProtocolError>> {
+        self.entries
+            .iter()
+            .find(|(k, f, _)| k == id && *f == fingerprint)
+            .map(|(_, _, v)| v)
     }
 
-    /// Remembers a result, evicting the oldest entry when full.
-    pub fn put(&mut self, id: String, result: Result<Value, ProtocolError>) {
+    /// Remembers a result, replacing an older entry with the same id and
+    /// evicting the oldest entry when full.
+    pub fn put(&mut self, id: String, fingerprint: u64, result: Result<Value, ProtocolError>) {
+        self.entries.retain(|(k, _, _)| *k != id);
         if self.entries.len() == RESPONSE_CACHE {
             self.entries.pop_front();
         }
-        self.entries.push_back((id, result));
+        self.entries.push_back((id, fingerprint, result));
     }
 }
 
@@ -309,14 +319,25 @@ mod tests {
     fn response_cache_evicts_oldest() {
         let mut cache = ResponseCache::default();
         for i in 0..=RESPONSE_CACHE {
-            cache.put(i.to_string(), Ok(Value::from(i)));
+            cache.put(i.to_string(), 7, Ok(Value::from(i)));
         }
-        assert!(cache.get("0").is_none());
-        assert_eq!(cache.get("64"), Some(&Ok(Value::from(64))));
+        assert!(cache.get("0", 7).is_none());
+        assert_eq!(cache.get("64", 7), Some(&Ok(Value::from(64))));
         cache.put(
             "e".into(),
+            7,
             Err(ProtocolError::new(ErrorCode::Forbidden, "no")),
         );
-        assert!(matches!(cache.get("e"), Some(Err(_))));
+        assert!(matches!(cache.get("e", 7), Some(Err(_))));
+    }
+
+    #[test]
+    fn response_cache_ignores_reused_id_with_other_content() {
+        let mut cache = ResponseCache::default();
+        cache.put("r2".into(), 1, Ok(Value::from("first")));
+        assert!(cache.get("r2", 2).is_none());
+        cache.put("r2".into(), 2, Ok(Value::from("second")));
+        assert_eq!(cache.get("r2", 2), Some(&Ok(Value::from("second"))));
+        assert!(cache.get("r2", 1).is_none());
     }
 }

@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math';
 
 import 'package:web_socket_channel/web_socket_channel.dart';
 
@@ -60,6 +61,11 @@ class SignalClient {
   DateTime _lastReceived = DateTime.now();
   int _nextId = 1;
 
+  /// Random per-socket prefix. The server remembers request ids for the
+  /// whole session, across resumes, so ids must not restart at `r1` on a new
+  /// socket: a reused id would be answered from the cache without running.
+  final String _idPrefix = 'r${Random.secure().nextInt(1 << 32).toRadixString(36)}-';
+
   /// Push events from the server.
   Stream<SignalEvent> get events => _events.stream;
 
@@ -104,7 +110,7 @@ class SignalClient {
     if (isClosed) {
       return Future.error(const RtcException(RtcErrorCode.connectionLost, 'signaling socket is closed'));
     }
-    final requestId = id ?? 'r${_nextId++}';
+    final requestId = id ?? '$_idPrefix${_nextId++}';
     final completer = Completer<Map<String, dynamic>>();
     _pending[requestId] = completer;
     _channel.sink.add(jsonEncode({'v': protocolVersion, 'type': type, 'id': requestId, 'data': data ?? const {}}));
