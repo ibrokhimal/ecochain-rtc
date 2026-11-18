@@ -70,7 +70,7 @@ Sinov paytida topilgan va tuzatilgan muammolar:
 
 * macOS (va iOS qurilmalar) LAN’dagi serverga **Local Network** ruxsatisiz ulana olmaydi (`No route to host`, errno 65). Ilovalarga `NSLocalNetworkUsageDescription` qo‘shildi.
 * Ulanishdan keyin kamera ochilmasa (`NotAllowedError`), xato faqat `lastError`da qolib, ekranda ko‘rinmas edi. Endi Meet ekranida qizil banner va logda xabar chiqadi.
-* macOS’da ruxsat oynasi ochiq turganda Flutter UI thread bloklanadi, heartbeat to‘xtaydi va server socket’ni yopadi. Sessiya resume bilan tiklandi. Bitta holatda shundan keyin Alice Bob’ning audiosini olmadi; Alice qayta ulangach muammo yo‘qoldi. Sababi hali aniqlanmagan (ochiq masala).
+* macOS’da ruxsat oynasi ochiq turganda Flutter UI thread bloklanadi va subscriber offer’ga javob kechikadi. Server 10 s dan keyin offer’ni **boshqacha** yangisi bilan almashtirardi, klient esa birinchisini qo‘llab bo‘lgan edi. Natijada WebRTC “order of m-lines doesn't match” bilan rad etib, Alice Bob’ning audiosini olmadi. **Tuzatildi:** server javobsiz offer’ni aynan o‘zgarmagan holda qayta yuboradi (ICE restart ham javobdan keyin); SDK subscriber offer’ni qo‘llay olmasa, subscriber’ni o‘zi qayta quradi (`subscriber.reset`). Regressiya testlari: `server/tests/signaling.rs::unanswered_offer_is_resent_unchanged` va `apps/meet/integration_test/resume_test.dart` (UI 20 s muzlatiladi, keyin resume va bot audiosi o‘lchanadi: 4 s da 16 KB audio keldi, m-line xatosi yo‘q). Bu sinov lokal serverda o‘tkazildi; Linux serverda qayta tekshirish Mac Linux tarmog‘iga qaytganda qilinadi.
 * Debug build har safar qayta yig‘ilganda macOS kamera ruxsatini yangi binary uchun qayta so‘raydi yoki rad etadi. Imzolangan release build’da bu muammo yo‘q.
 
 ## Yuklama sinovi (25 ishtirokchi)

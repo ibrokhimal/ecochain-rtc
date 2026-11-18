@@ -873,9 +873,21 @@ class RtcSession extends ChangeNotifier {
             participantId: t['participant_id'] as String,
           )),
       ]);
-    await pc.setRemoteDescription(RTCSessionDescription(data['sdp'] as String, 'offer'));
-    final answer = await pc.createAnswer();
-    await pc.setLocalDescription(answer);
+    final RTCSessionDescription answer;
+    try {
+      await pc.setRemoteDescription(RTCSessionDescription(data['sdp'] as String, 'offer'));
+      answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+    } catch (e) {
+      // The peer and the server disagree about the negotiated state (for
+      // example after a lost answer). Patching is not possible; start the
+      // subscriber over so remote media comes back by itself.
+      debugPrint('ecochain_rtc: subscriber offer rejected, resetting: $e');
+      if (!_alive(generation) || pc != _subscriber) return;
+      await _closeSubscriber();
+      await _signal?.request('subscriber.reset');
+      return;
+    }
     if (!_alive(generation) || pc != _subscriber) return;
     try {
       await _signal?.request('subscriber.answer', {'sdp': answer.sdp, 'revision': data['revision']});

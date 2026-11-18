@@ -35,7 +35,13 @@ use str0m::{
 };
 
 /// A subscriber that does not answer an offer within this time gets the
-/// offer again (possibly merged with newer changes).
+/// very same offer again.
+///
+/// The offer is never replaced by a different one while unanswered: the
+/// client may already have applied it (its answer can be lost with a dying
+/// socket), and WebRTC rejects a later offer whose m-lines differ from the
+/// applied one ("order of m-lines ... doesn't match"). Changes made in the
+/// meantime go into the next offer, after the answer arrives.
 const OFFER_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Minimum spacing of keyframe requests to one publisher track. Keyframes
@@ -398,6 +404,7 @@ impl Room {
             .as_mut()
             .ok_or_else(|| ProtocolError::new(ErrorCode::InvalidState, "no subscriber peer"))?;
         if sub.pending.as_ref().map(|p| p.revision) != Some(revision) {
+            tracing::debug!(revision, pending = ?sub.pending.as_ref().map(|p| p.revision), "outdated subscriber answer");
             return Err(ProtocolError::new(
                 ErrorCode::InvalidState,
                 "answer is for an outdated offer",
@@ -473,12 +480,9 @@ impl Room {
             .subscriber
             .as_mut()
             .ok_or_else(|| ProtocolError::new(ErrorCode::InvalidState, "no subscriber peer"))?;
+        // Applied with the next offer. An outstanding offer is kept (see
+        // OFFER_TIMEOUT); the restart follows once it is answered.
         sub.ice_restart = true;
-        // An unanswered offer would block the restart; drop it and fold its
-        // changes into the restart offer.
-        if sub.pending.take().is_some() {
-            revert_pending(sub);
-        }
         Ok(())
     }
 
@@ -685,8 +689,15 @@ impl Room {
         peer.refresh_ufrag(&sockets, &packets);
         peer.wake(Instant::now());
         sub.revision += 1;
+        let sdp = offer.to_sdp_string();
+        tracing::debug!(
+            participant = %participant.id,
+            revision = sub.revision,
+            m_lines = sdp.lines().filter(|l| l.starts_with("m=")).count(),
+            "subscriber offer"
+        );
         let event = json!({
-            "sdp": offer.to_sdp_string(),
+            "sdp": sdp,
             "revision": sub.revision,
             "tracks": sub.mappings(),
         });
@@ -893,18 +904,19 @@ impl Room {
     pub(super) fn media_housekeeping(&mut self, now: Instant) {
         // Re-send unanswered offers.
         for index in 0..self.participants.len() {
-            let Some(sub) = self.participants[index].subscriber.as_mut() else {
+            let participant = &mut self.participants[index];
+            let Some(pending) = participant
+                .subscriber
+                .as_mut()
+                .and_then(|s| s.pending.as_mut())
+                .filter(|p| now - p.sent_at >= OFFER_TIMEOUT)
+            else {
                 continue;
             };
-            if sub
-                .pending
-                .as_ref()
-                .is_some_and(|p| now - p.sent_at >= OFFER_TIMEOUT)
-            {
-                sub.pending = None;
-                revert_pending(sub);
-                self.negotiate(index);
-            }
+            pending.sent_at = now;
+            tracing::debug!(participant = %participant.id, revision = pending.revision, "resending unanswered subscriber offer");
+            let event = pending.event.clone();
+            participant.send(Outbound::event("subscriber.offer", event));
         }
 
         // Safety net: picks up any change whose caller did not negotiate.
@@ -956,17 +968,6 @@ struct Desired {
     source: TrackSource,
     quality: Quality,
     lowest_rid: Option<Rid>,
-}
-
-/// Undoes the state transitions of an offer that will never be answered.
-fn revert_pending(sub: &mut Subscriber) {
-    for out in &mut sub.out {
-        match out.state {
-            OutState::Negotiating(_) => out.state = OutState::ToOpen,
-            OutState::NegotiatingStop(mid) => out.state = OutState::ToStop(mid),
-            _ => {}
-        }
-    }
 }
 
 fn validate_tracks(tracks: &[OfferedTrack]) -> Result<(), ProtocolError> {

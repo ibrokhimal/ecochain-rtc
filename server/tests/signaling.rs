@@ -413,3 +413,37 @@ async fn leaving_cleans_up_room_and_metrics() {
     assert_eq!(server.metric("ecochain_rtc_rooms_active"), 0);
     assert_eq!(server.metric("ecochain_rtc_connections_active"), 0);
 }
+
+/// Regression: a client that froze (modal permission dialog) may already
+/// have applied an offer whose answer never arrived. The server must resend
+/// that exact offer instead of building a different one, or WebRTC rejects
+/// it with "order of m-lines ... doesn't match" and the subscriber is dead.
+#[tokio::test]
+async fn unanswered_offer_is_resent_unchanged() {
+    let server = common::start("").await;
+    let mut alice = server.signal().await;
+    alice
+        .request(
+            "join",
+            json!({"token": server.token("frozen", "alice", Role::Participant)}),
+        )
+        .await
+        .unwrap();
+    let first = alice.wait_event("subscriber.offer", WAIT).await.unwrap();
+
+    // Meanwhile somebody joins and publishes audio: a change that must wait.
+    let bob = ecochain_rtc_server::bot::Bot::start(server.bot("frozen", "bob"))
+        .await
+        .unwrap();
+
+    let again = alice
+        .wait_event("subscriber.offer", Duration::from_secs(15))
+        .await
+        .unwrap();
+    assert_eq!(again["data"]["revision"], first["data"]["revision"]);
+    assert_eq!(
+        again["data"]["sdp"], first["data"]["sdp"],
+        "same m-lines, same order"
+    );
+    bob.leave().await;
+}
