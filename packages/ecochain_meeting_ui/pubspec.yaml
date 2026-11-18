@@ -1,0 +1,19 @@
+name: ecochain_meeting_ui
+description: Shared Ecochain meeting screen built on the ecochain_rtc SDK.
+version: 0.1.0
+publish_to: none
+
+environment:
+  sdk: ^3.10.0
+  flutter: ">=3.38.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  ecochain_rtc:
+    path: ../ecochain_rtc
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0

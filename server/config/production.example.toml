@@ -1,0 +1,32 @@
+# Production template. Copy, adjust and keep secrets in the environment.
+mode = "production"
+
+[http]
+bind = "0.0.0.0:443"
+tls_cert = "/etc/ecochain-rtc/tls/fullchain.pem"
+tls_key = "/etc/ecochain-rtc/tls/privkey.pem"
+# Or terminate TLS in a reverse proxy and set:
+# behind_tls_proxy = true
+
+[auth]
+issuer = "ecochain"
+token_secret_env = "ECOCHAIN_RTC_TOKEN_SECRET"   # >= 32 random bytes
+admin_key_env = "ECOCHAIN_RTC_ADMIN_KEY"         # >= 16 random bytes
+
+[rooms]
+auto_create = false            # rooms are created by the backend via POST /v1/rooms
+default_max_participants = 25
+max_participants_limit = 100
+max_video_subscriptions = 9
+reconnect_grace_secs = 30
+empty_room_ttl_secs = 60
+
+[media]
+udp_port = 7882
+# Bind the private interface and announce the public IP (cloud 1:1 NAT).
+listen = [{ bind_ip = "10.0.0.5", advertise_ip = "203.0.113.10" }]
+# TURN is required for clients behind symmetric NAT or UDP-blocking firewalls.
+ice_servers = [
+  { urls = ["stun:stun.example.com:3478"] },
+  { urls = ["turns:turn.example.com:5349?transport=tcp"], username = "ecochain", credential = "from-your-turn-service" },
+]

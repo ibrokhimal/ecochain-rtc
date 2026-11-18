@@ -1,0 +1,25 @@
+name: ecochain_meet_app
+description: Standalone Ecochain Meet application.
+publish_to: none
+version: 0.1.0+1
+
+environment:
+  sdk: ^3.10.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+  ecochain_rtc:
+    path: ../../packages/ecochain_rtc
+  ecochain_meeting_ui:
+    path: ../../packages/ecochain_meeting_ui
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  integration_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true

@@ -1,0 +1,10 @@
+.DS_Store
+server/target/
+**/build/
+**/.dart_tool/
+**/.flutter-plugins-dependencies
+**/*.iml
+**/.idea/
+*.pem
+*.key
+.env

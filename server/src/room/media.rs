@@ -1,0 +1,1003 @@
+//! Media side of the room: peer lifecycle, SDP negotiation and forwarding.
+//!
+//! Forwarding works on whole media units (`Event::MediaData`, str0m "frame
+//! mode"). str0m depacketizes incoming RTP, handles NACK/RTX towards the
+//! publisher, and re-packetizes for every subscriber with its own sequence
+//! numbers. That makes simulcast layer switching safe: the receiver never
+//! sees sequence number gaps, only a keyframe from the new layer.
+
+use super::{
+    participant::{OutState, OutTrack, PendingOffer, PublishedTrack, Subscriber},
+    random_id, Room,
+};
+use crate::{
+    protocol::{
+        ErrorCode, OfferedTrack, Outbound, PeerTarget, ProtocolError, Quality, SubscriptionChange,
+        TrackSource,
+    },
+    sfu::{
+        layers::{self, VideoDemand},
+        peer::{parse_candidate, Peer, PeerKind},
+        udp::Datagram,
+    },
+};
+use serde_json::json;
+use std::{
+    collections::HashSet,
+    sync::atomic::Ordering,
+    time::{Duration, Instant},
+};
+use str0m::{
+    bwe::{Bitrate, BweKind},
+    change::{SdpAnswer, SdpOffer},
+    media::{Direction, KeyframeRequestKind, MediaData, MediaKind, Mid, Rid},
+    Event, IceConnectionState,
+};
+
+/// A subscriber that does not answer an offer within this time gets the
+/// offer again (possibly merged with newer changes).
+const OFFER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Minimum spacing of keyframe requests to one publisher track. Keyframes
+/// are large; asking too often hurts everybody's bandwidth.
+const KEYFRAME_THROTTLE: Duration = Duration::from_millis(500);
+
+/// Window for active speaker detection.
+const SPEAKER_WINDOW: Duration = Duration::from_millis(500);
+
+/// Linear audio level (0..1) above which a participant counts as speaking.
+/// 0.03 is about -30 dBov, quieter than normal speech, louder than room noise.
+const SPEAKING_LEVEL: f32 = 0.03;
+
+/// Upper bound of drive iterations per wakeup, to keep one room from
+/// starving others if events keep producing events.
+const MAX_DRIVE_ROUNDS: usize = 16;
+
+impl Room {
+    /// Earliest timer of any peer, but never later than the next tick.
+    pub(super) fn next_timeout(&self) -> Instant {
+        let mut next = Instant::now() + super::TICK;
+        for participant in &self.participants {
+            if let Some(peer) = &participant.publisher {
+                next = next.min(peer.next_timeout());
+            }
+            if let Some(sub) = &participant.subscriber {
+                next = next.min(sub.peer.next_timeout());
+            }
+        }
+        next
+    }
+
+    pub(super) fn handle_datagram(&mut self, datagram: Datagram) {
+        for index in 0..self.participants.len() {
+            for kind in [PeerKind::Publisher, PeerKind::Subscriber] {
+                let Some(peer) = self.peer_mut(index, kind) else {
+                    continue;
+                };
+                if peer.accepts(&datagram) {
+                    if let Err(e) = peer.handle_datagram(&datagram) {
+                        tracing::debug!(error = ?e, "peer rejected datagram");
+                        self.fail_peer(index, kind);
+                    }
+                    return;
+                }
+            }
+        }
+        self.services
+            .metrics
+            .udp_dropped_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Advances all peers, sends their datagrams and processes their events
+    /// until nothing new happens.
+    pub(super) fn drive(&mut self) {
+        for _ in 0..MAX_DRIVE_ROUNDS {
+            let now = Instant::now();
+            let mut produced = Vec::new();
+            for index in 0..self.participants.len() {
+                for kind in [PeerKind::Publisher, PeerKind::Subscriber] {
+                    let sockets = self.services.sockets.clone();
+                    let Some(peer) = self.peer_mut(index, kind) else {
+                        continue;
+                    };
+                    // Peers whose timer is not due and that got no input
+                    // since the last poll have nothing to do. Skipping them
+                    // matters with 50 peers and thousands of packets/s.
+                    if !peer.is_due(now) {
+                        continue;
+                    }
+                    let mut events = Vec::new();
+                    let result = peer
+                        .handle_timeout(now)
+                        .and_then(|_| peer.poll(&sockets, &mut events));
+                    let alive = result.is_ok() && peer.rtc.is_alive();
+                    if !events.is_empty() {
+                        produced.push((self.participants[index].id.clone(), kind, events));
+                    }
+                    if !alive {
+                        self.fail_peer(index, kind);
+                    }
+                }
+            }
+            if produced.is_empty() {
+                return;
+            }
+            for (participant_id, kind, events) in produced {
+                for event in events {
+                    self.handle_event(&participant_id, kind, event);
+                }
+            }
+        }
+    }
+
+    fn peer_mut(&mut self, index: usize, kind: PeerKind) -> Option<&mut Peer> {
+        let participant = self.participants.get_mut(index)?;
+        match kind {
+            PeerKind::Publisher => participant.publisher.as_mut(),
+            PeerKind::Subscriber => participant.subscriber.as_mut().map(|s| &mut s.peer),
+        }
+    }
+
+    fn index_of(&self, participant_id: &str) -> Option<usize> {
+        self.participants
+            .iter()
+            .position(|p| p.id == participant_id)
+    }
+
+    /// A peer hit a fatal error or ICE timed out for good. The client is told
+    /// so it can rebuild that peer (`publisher.offer` with `reset` or
+    /// `subscriber.reset`).
+    fn fail_peer(&mut self, index: usize, kind: PeerKind) {
+        self.services
+            .metrics
+            .peer_failures_total
+            .fetch_add(1, Ordering::Relaxed);
+        let sockets = self.services.sockets.clone();
+        let target = match kind {
+            PeerKind::Publisher => {
+                if let Some(mut peer) = self.participants[index].publisher.take() {
+                    peer.close(&sockets);
+                }
+                self.unpublish(index, None);
+                "publisher"
+            }
+            PeerKind::Subscriber => {
+                if let Some(mut sub) = self.participants[index].subscriber.take() {
+                    sub.peer.close(&sockets);
+                }
+                "subscriber"
+            }
+        };
+        tracing::warn!(room = %self.id, participant = %self.participants[index].id, target, "peer failed");
+        self.participants[index].send(Outbound::event("peer.failed", json!({"target": target})));
+    }
+
+    fn handle_event(&mut self, participant_id: &str, kind: PeerKind, event: Event) {
+        let Some(index) = self.index_of(participant_id) else {
+            return;
+        };
+        match (kind, event) {
+            (PeerKind::Publisher, Event::MediaData(data)) => self.forward(index, data),
+            (PeerKind::Subscriber, Event::KeyframeRequest(request)) => {
+                let Some(sub) = &self.participants[index].subscriber else {
+                    return;
+                };
+                let Some(out) = sub.out.iter().find(|o| o.state.mid() == Some(request.mid)) else {
+                    return;
+                };
+                let (track_id, publisher_id, rid) = (
+                    out.track_id.clone(),
+                    out.publisher_id.clone(),
+                    out.current_rid.or(out.target_rid),
+                );
+                self.request_keyframe(&publisher_id, &track_id, rid, request.kind);
+            }
+            (
+                PeerKind::Subscriber,
+                Event::EgressBitrateEstimate(BweKind::Twcc { estimate, .. }),
+            ) => {
+                if let Some(sub) = self.participants[index].subscriber.as_mut() {
+                    sub.estimate_kbps = Some(estimate.as_u64() / 1000);
+                    tracing::debug!(
+                        participant = participant_id,
+                        kbps = estimate.as_u64() / 1000,
+                        "bandwidth estimate"
+                    );
+                }
+            }
+            (_, Event::IceConnectionStateChange(state)) => {
+                tracing::debug!(room = %self.id, participant = participant_id, ?kind, ?state, "ice state");
+                if state == IceConnectionState::Disconnected {
+                    // Not fatal: the client will try an ICE restart. If that
+                    // never happens str0m eventually gives up and the peer
+                    // fails, which `drive` reports to the client.
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // ----------------------------------------------------------------------
+    // Publisher
+    // ----------------------------------------------------------------------
+
+    pub(super) fn publisher_offer(
+        &mut self,
+        index: usize,
+        sdp: &str,
+        tracks: &[OfferedTrack],
+        reset: bool,
+    ) -> Result<String, ProtocolError> {
+        if !tracks.is_empty() && !self.participants[index].can_publish {
+            return Err(ProtocolError::new(
+                ErrorCode::Forbidden,
+                "token does not allow publishing",
+            ));
+        }
+        validate_tracks(tracks)?;
+        let offer = SdpOffer::from_sdp_string(sdp).map_err(|e| {
+            ProtocolError::new(ErrorCode::BadRequest, format!("invalid offer: {e}"))
+        })?;
+
+        let sockets = self.services.sockets.clone();
+        if reset {
+            if let Some(mut old) = self.participants[index].publisher.take() {
+                old.close(&sockets);
+            }
+            self.unpublish(index, None);
+        }
+        let packets = self.packets_tx.clone();
+        let participant = &mut self.participants[index];
+        let peer = participant.publisher.get_or_insert_with(|| {
+            Peer::new(PeerKind::Publisher, &sockets, &packets, Instant::now())
+        });
+        let answer = peer.rtc.sdp_api().accept_offer(offer).map_err(|e| {
+            ProtocolError::new(ErrorCode::InvalidState, format!("offer rejected: {e}"))
+        })?;
+        peer.refresh_ufrag(&sockets, &packets);
+        peer.wake(Instant::now());
+
+        // The offered track list is the source of truth: new mids become
+        // tracks, missing ones are unpublished.
+        let mut added = Vec::new();
+        let mut kept = HashSet::new();
+        for offered in tracks {
+            let mid = Mid::from(offered.mid.as_str());
+            if peer.rtc.media(mid).is_none() {
+                return Err(ProtocolError::new(
+                    ErrorCode::BadRequest,
+                    format!("mid {} not in offer", offered.mid),
+                ));
+            }
+            let layers: Vec<Rid> = offered
+                .layers
+                .iter()
+                .map(|r| Rid::from(r.as_str()))
+                .collect();
+            if let Some(track) = participant
+                .tracks
+                .iter_mut()
+                .find(|t| t.mid == mid && t.source == offered.source)
+            {
+                track.muted = offered.muted;
+                track.layers = layers;
+                kept.insert(track.id.clone());
+            } else {
+                let track = PublishedTrack {
+                    id: random_id("TR_"),
+                    mid,
+                    kind: if offered.source.is_video() {
+                        MediaKind::Video
+                    } else {
+                        MediaKind::Audio
+                    },
+                    source: offered.source,
+                    muted: offered.muted,
+                    layers,
+                    last_keyframe_request: None,
+                };
+                kept.insert(track.id.clone());
+                added.push(track.id.clone());
+                participant.tracks.push(track);
+            }
+        }
+        self.unpublish(index, Some(&kept));
+        let answer = answer.to_sdp_string();
+
+        let info = self.participants[index].info();
+        self.broadcast_except(
+            index,
+            Outbound::event("participant.updated", json!({"participant": info})),
+        );
+        Ok(answer)
+    }
+
+    /// Removes published tracks of `index` that are not in `keep` (all of
+    /// them when `keep` is `None`) and stops forwarding them.
+    fn unpublish(&mut self, index: usize, keep: Option<&HashSet<String>>) {
+        let participant = &mut self.participants[index];
+        let before = participant.tracks.len();
+        participant
+            .tracks
+            .retain(|t| keep.is_some_and(|keep| keep.contains(&t.id)));
+        if participant.tracks.len() == before {
+            return;
+        }
+        if keep.is_some() {
+            let info = participant.info();
+            self.broadcast_except(
+                index,
+                Outbound::event("participant.updated", json!({"participant": info})),
+            );
+        }
+        // Stop forwarding right away; the m-lines are removed by the next
+        // `negotiate_all`, which every caller runs.
+        for other in 0..self.participants.len() {
+            if other != index {
+                self.reconcile(other);
+            }
+        }
+    }
+
+    pub(super) fn mute(
+        &mut self,
+        index: usize,
+        source: TrackSource,
+        muted: bool,
+    ) -> Result<(), ProtocolError> {
+        let participant = &mut self.participants[index];
+        let track = participant
+            .tracks
+            .iter_mut()
+            .find(|t| t.source == source)
+            .ok_or_else(|| {
+                ProtocolError::new(ErrorCode::InvalidState, "source is not published")
+            })?;
+        if track.muted != muted {
+            track.muted = muted;
+            let info = participant.info();
+            self.broadcast_except(
+                index,
+                Outbound::event("participant.updated", json!({"participant": info})),
+            );
+        }
+        Ok(())
+    }
+
+    // ----------------------------------------------------------------------
+    // Subscriber
+    // ----------------------------------------------------------------------
+
+    pub(super) fn create_subscriber(&mut self, index: usize) {
+        let peer = Peer::new(
+            PeerKind::Subscriber,
+            &self.services.sockets,
+            &self.packets_tx,
+            Instant::now(),
+        );
+        self.participants[index].subscriber = Some(Subscriber::new(peer));
+        self.negotiate(index);
+    }
+
+    pub(super) fn reset_subscriber(&mut self, index: usize) {
+        if let Some(mut old) = self.participants[index].subscriber.take() {
+            old.peer.close(&self.services.sockets);
+        }
+        self.create_subscriber(index);
+    }
+
+    pub(super) fn subscriber_answer(
+        &mut self,
+        index: usize,
+        sdp: &str,
+        revision: u32,
+    ) -> Result<(), ProtocolError> {
+        let sub = self.participants[index]
+            .subscriber
+            .as_mut()
+            .ok_or_else(|| ProtocolError::new(ErrorCode::InvalidState, "no subscriber peer"))?;
+        if sub.pending.as_ref().map(|p| p.revision) != Some(revision) {
+            return Err(ProtocolError::new(
+                ErrorCode::InvalidState,
+                "answer is for an outdated offer",
+            ));
+        }
+        let answer = SdpAnswer::from_sdp_string(sdp).map_err(|e| {
+            ProtocolError::new(ErrorCode::BadRequest, format!("invalid answer: {e}"))
+        })?;
+        let pending = sub.pending.take().expect("checked above");
+        sub.peer
+            .rtc
+            .sdp_api()
+            .accept_answer(pending.pending, answer)
+            .map_err(|e| {
+                ProtocolError::new(ErrorCode::InvalidState, format!("answer rejected: {e}"))
+            })?;
+        sub.peer.wake(Instant::now());
+
+        let mut opened = Vec::new();
+        for out in &mut sub.out {
+            if let OutState::Negotiating(mid) = out.state {
+                out.state = OutState::Open(mid);
+                if out.kind == MediaKind::Video {
+                    opened.push((
+                        out.publisher_id.clone(),
+                        out.track_id.clone(),
+                        out.target_rid,
+                    ));
+                }
+            }
+        }
+        sub.out
+            .retain(|o| !matches!(o.state, OutState::NegotiatingStop(_)));
+        // A new video receiver can only start decoding at a keyframe.
+        for (publisher_id, track_id, rid) in opened {
+            self.request_keyframe(&publisher_id, &track_id, rid, KeyframeRequestKind::Pli);
+        }
+        Ok(())
+    }
+
+    pub(super) fn add_candidate(
+        &mut self,
+        index: usize,
+        target: PeerTarget,
+        line: &str,
+    ) -> Result<bool, ProtocolError> {
+        let kind = match target {
+            PeerTarget::Publisher => PeerKind::Publisher,
+            PeerTarget::Subscriber => PeerKind::Subscriber,
+        };
+        let peer = self
+            .peer_mut(index, kind)
+            .ok_or_else(|| ProtocolError::new(ErrorCode::InvalidState, "peer does not exist"))?;
+        // Unparseable candidates (for example mDNS `.local` names) are
+        // ignored: the server learns peer-reflexive addresses from STUN.
+        match parse_candidate(line) {
+            Some(candidate) => {
+                peer.rtc.add_remote_candidate(candidate);
+                peer.wake(Instant::now());
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    pub(super) fn ice_restart(
+        &mut self,
+        index: usize,
+        target: PeerTarget,
+    ) -> Result<(), ProtocolError> {
+        if target == PeerTarget::Publisher {
+            return Err(ProtocolError::new(
+                ErrorCode::BadRequest,
+                "restart the publisher by sending publisher.offer with new ICE credentials",
+            ));
+        }
+        let sub = self.participants[index]
+            .subscriber
+            .as_mut()
+            .ok_or_else(|| ProtocolError::new(ErrorCode::InvalidState, "no subscriber peer"))?;
+        sub.ice_restart = true;
+        // An unanswered offer would block the restart; drop it and fold its
+        // changes into the restart offer.
+        if sub.pending.take().is_some() {
+            revert_pending(sub);
+        }
+        Ok(())
+    }
+
+    pub(super) fn update_subscriptions(
+        &mut self,
+        index: usize,
+        changes: &[SubscriptionChange],
+    ) -> Result<(), ProtocolError> {
+        let mut video = self.participants[index].video_subscriptions.clone();
+        let mut muted_audio = self.participants[index].muted_audio.clone();
+        for change in changes {
+            let Some(track) = self
+                .participants
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != index)
+                .flat_map(|(_, p)| p.tracks.iter())
+                .find(|t| t.id == change.track_id)
+            else {
+                return Err(ProtocolError::new(
+                    ErrorCode::BadRequest,
+                    format!("unknown track {}", change.track_id),
+                ));
+            };
+            match (track.kind, change.subscribed) {
+                (MediaKind::Video, true) => {
+                    video.insert(track.id.clone(), change.quality);
+                }
+                (MediaKind::Video, false) => {
+                    video.remove(&track.id);
+                }
+                (MediaKind::Audio, true) => {
+                    muted_audio.remove(&track.id);
+                }
+                (MediaKind::Audio, false) => {
+                    muted_audio.insert(track.id.clone());
+                }
+            }
+        }
+        let limit = self.services.config.rooms.max_video_subscriptions;
+        if video.len() > limit {
+            return Err(ProtocolError::new(
+                ErrorCode::LimitExceeded,
+                format!("at most {limit} video subscriptions"),
+            ));
+        }
+        let participant = &mut self.participants[index];
+        participant.video_subscriptions = video;
+        participant.muted_audio = muted_audio;
+        // Quality changes apply right away; m-line changes in `negotiate`.
+        self.reconcile(index);
+        Ok(())
+    }
+
+    /// Tracks participant `index` should receive: every other participant's
+    /// audio (unless it unsubscribed) plus the video tracks it subscribed to.
+    fn desired_tracks(&self, index: usize) -> Vec<Desired> {
+        let me = &self.participants[index];
+        let mut desired = Vec::new();
+        for other in self.participants.iter().filter(|p| p.id != me.id) {
+            for track in &other.tracks {
+                let quality = match track.kind {
+                    MediaKind::Audio if me.muted_audio.contains(&track.id) => continue,
+                    MediaKind::Audio => Quality::default(),
+                    MediaKind::Video => match me.video_subscriptions.get(&track.id) {
+                        Some(quality) => *quality,
+                        None => continue,
+                    },
+                };
+                desired.push(Desired {
+                    track_id: track.id.clone(),
+                    publisher_id: other.id.clone(),
+                    kind: track.kind,
+                    source: track.source,
+                    quality,
+                    lowest_rid: track.layers.first().copied(),
+                });
+            }
+        }
+        desired
+    }
+
+    /// Brings the subscriber's forwarded tracks in line with
+    /// [`Room::desired_tracks`].
+    ///
+    /// m-lines are only added or stopped while no offer is outstanding, so
+    /// at that point every entry is `ToOpen`, `Open` or `ToStop`. Quality
+    /// changes apply immediately.
+    fn reconcile(&mut self, index: usize) {
+        let desired = self.desired_tracks(index);
+        let participant = &mut self.participants[index];
+        let wanted: HashSet<&str> = desired.iter().map(|d| d.track_id.as_str()).collect();
+        participant
+            .video_subscriptions
+            .retain(|id, _| wanted.contains(id.as_str()));
+
+        let Some(sub) = participant.subscriber.as_mut() else {
+            return;
+        };
+        let settled = sub.pending.is_none();
+        for out in &mut sub.out {
+            match desired.iter().find(|d| d.track_id == out.track_id) {
+                Some(d) if out.state.is_wanted() => out.quality = d.quality,
+                None if settled => {
+                    if let OutState::Open(mid) = out.state {
+                        out.state = OutState::ToStop(mid);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if settled {
+            sub.out
+                .retain(|o| o.state != OutState::ToOpen || wanted.contains(o.track_id.as_str()));
+            for d in &desired {
+                if sub
+                    .out
+                    .iter()
+                    .any(|o| o.track_id == d.track_id && o.state.is_wanted())
+                {
+                    continue;
+                }
+                sub.out.push(OutTrack {
+                    track_id: d.track_id.clone(),
+                    publisher_id: d.publisher_id.clone(),
+                    kind: d.kind,
+                    source: d.source,
+                    state: OutState::ToOpen,
+                    quality: d.quality,
+                    target_rid: d.lowest_rid,
+                    current_rid: None,
+                    timeline: Default::default(),
+                });
+            }
+        }
+        self.allocate_layers(index);
+    }
+
+    pub(super) fn negotiate_all(&mut self) {
+        for index in 0..self.participants.len() {
+            self.negotiate(index);
+        }
+    }
+
+    /// Sends a subscriber offer when forwarded tracks changed and no offer
+    /// is outstanding. Changes made while an offer is pending are collected
+    /// and sent once the answer arrives.
+    fn negotiate(&mut self, index: usize) {
+        if self.participants[index]
+            .subscriber
+            .as_ref()
+            .is_none_or(|s| s.pending.is_some())
+        {
+            return;
+        }
+        self.reconcile(index);
+        let sockets = self.services.sockets.clone();
+        let packets = self.packets_tx.clone();
+        let participant = &mut self.participants[index];
+        let Some(sub) = participant.subscriber.as_mut() else {
+            return;
+        };
+        let Subscriber {
+            peer,
+            out,
+            ice_restart,
+            has_channel,
+            ..
+        } = sub;
+        let mut change = peer.rtc.sdp_api();
+        if !*has_channel {
+            change.add_channel("ecochain".into());
+        }
+        if *ice_restart {
+            change.ice_restart(true);
+        }
+        for track in out.iter_mut() {
+            match track.state {
+                OutState::ToOpen => {
+                    let mid = change.add_media(
+                        track.kind,
+                        Direction::SendOnly,
+                        Some(track.publisher_id.clone()),
+                        Some(track.track_id.clone()),
+                        None,
+                    );
+                    track.state = OutState::Negotiating(mid);
+                }
+                OutState::ToStop(mid) => {
+                    change.stop_media(mid);
+                    track.state = OutState::NegotiatingStop(mid);
+                }
+                _ => {}
+            }
+        }
+        if !change.has_changes() {
+            return;
+        }
+        let Some((offer, pending)) = change.apply() else {
+            return;
+        };
+        *has_channel = true;
+        *ice_restart = false;
+        peer.refresh_ufrag(&sockets, &packets);
+        peer.wake(Instant::now());
+        sub.revision += 1;
+        let event = json!({
+            "sdp": offer.to_sdp_string(),
+            "revision": sub.revision,
+            "tracks": sub.mappings(),
+        });
+        sub.pending = Some(PendingOffer {
+            pending,
+            revision: sub.revision,
+            event: event.clone(),
+            sent_at: Instant::now(),
+        });
+        participant.send(Outbound::event("subscriber.offer", event));
+    }
+
+    // ----------------------------------------------------------------------
+    // Forwarding
+    // ----------------------------------------------------------------------
+
+    fn forward(&mut self, index: usize, data: MediaData) {
+        self.services
+            .metrics
+            .media_in_total
+            .fetch_add(1, Ordering::Relaxed);
+        let publisher = &mut self.participants[index];
+        let Some(track) = publisher.tracks.iter().find(|t| t.mid == data.mid) else {
+            return;
+        };
+        let (track_id, kind) = (track.id.clone(), track.kind);
+        let publisher_id = publisher.id.clone();
+
+        let mut audio_level = None;
+        if kind == MediaKind::Audio {
+            if let Some(level) = data.ext_vals.audio_level {
+                // RFC 6464: level is -dBov, 0 is loudest, -127 silence.
+                let linear = 10f32.powf(f32::from(level.min(0)) / 20.0);
+                publisher.level_sum += linear;
+                publisher.level_count += 1;
+                audio_level = Some((level, data.ext_vals.voice_activity.unwrap_or(false)));
+            }
+        } else if !data.contiguous {
+            // Packets were lost beyond what NACK recovered; the decoder
+            // needs a fresh keyframe.
+            self.request_keyframe(&publisher_id, &track_id, data.rid, KeyframeRequestKind::Pli);
+        }
+
+        let now = Instant::now();
+        let mut written = 0u64;
+        let mut wanted_keyframe = Vec::new();
+        for (other_index, other) in self.participants.iter_mut().enumerate() {
+            if other_index == index {
+                continue;
+            }
+            let Some(sub) = other.subscriber.as_mut() else {
+                continue;
+            };
+            let Some((out, mid)) = sub.out.iter_mut().find_map(|o| match o.state {
+                OutState::Open(mid) if o.track_id == track_id => Some((o, mid)),
+                _ => None,
+            }) else {
+                continue;
+            };
+
+            let mut switched = false;
+            if data.rid.is_some() && data.rid != out.current_rid {
+                if data.rid != out.target_rid {
+                    continue;
+                }
+                if !data.is_keyframe() {
+                    wanted_keyframe.push(out.target_rid);
+                    continue;
+                }
+                switched = out.current_rid.is_some();
+                out.current_rid = data.rid;
+            }
+            let time = out.timeline.map(data.time, data.network_time, switched);
+            let Some(mut writer) = sub.peer.rtc.writer(mid) else {
+                continue;
+            };
+            let Some(pt) = writer.match_params(data.params) else {
+                continue;
+            };
+            if let Some((level, voice)) = audio_level {
+                writer = writer.audio_level(level, voice);
+            }
+            match writer.write(pt, data.network_time, time, data.data.clone()) {
+                Ok(()) => {
+                    written += 1;
+                    sub.peer.wake(now);
+                }
+                Err(e) => tracing::debug!(error = ?e, "forward write failed"),
+            }
+        }
+        self.services
+            .metrics
+            .media_out_total
+            .fetch_add(written, Ordering::Relaxed);
+        for rid in wanted_keyframe {
+            self.request_keyframe(&publisher_id, &track_id, rid, KeyframeRequestKind::Pli);
+        }
+    }
+
+    fn request_keyframe(
+        &mut self,
+        publisher_id: &str,
+        track_id: &str,
+        rid: Option<Rid>,
+        kind: KeyframeRequestKind,
+    ) {
+        let Some(index) = self.index_of(publisher_id) else {
+            return;
+        };
+        let participant = &mut self.participants[index];
+        let Some(track) = participant.tracks.iter_mut().find(|t| t.id == track_id) else {
+            return;
+        };
+        let now = Instant::now();
+        if track
+            .last_keyframe_request
+            .is_some_and(|at| now - at < KEYFRAME_THROTTLE)
+        {
+            return;
+        }
+        let Some(peer) = participant.publisher.as_mut() else {
+            return;
+        };
+        let Some(mut writer) = peer.rtc.writer(track.mid) else {
+            return;
+        };
+        if writer.is_request_keyframe_possible(kind) && writer.request_keyframe(rid, kind).is_ok() {
+            track.last_keyframe_request = Some(now);
+            peer.wake(now);
+        }
+    }
+
+    /// Picks the simulcast layer per forwarded video track from requested
+    /// quality and the subscriber's bandwidth estimate.
+    fn allocate_layers(&mut self, index: usize) {
+        let layer_counts: Vec<(String, Vec<Rid>)> = self
+            .participants
+            .iter()
+            .flat_map(|p| p.tracks.iter())
+            .filter(|t| t.kind == MediaKind::Video)
+            .map(|t| (t.id.clone(), t.layers.clone()))
+            .collect();
+        let participant = &mut self.participants[index];
+        let Some(sub) = participant.subscriber.as_mut() else {
+            return;
+        };
+        let videos: Vec<usize> = (0..sub.out.len())
+            .filter(|&i| sub.out[i].kind == MediaKind::Video && sub.out[i].state.is_wanted())
+            .collect();
+        let rids_of = |track_id: &str| {
+            layer_counts
+                .iter()
+                .find(|(id, _)| id == track_id)
+                .map(|(_, rids)| rids.clone())
+                .unwrap_or_default()
+        };
+        let demands: Vec<VideoDemand> = videos
+            .iter()
+            .map(|&i| VideoDemand {
+                layers: rids_of(&sub.out[i].track_id).len(),
+                quality: sub.out[i].quality,
+                screen: sub.out[i].source == TrackSource::Screen,
+            })
+            .collect();
+        let chosen = layers::allocate(&demands, sub.estimate_kbps);
+        let mut desired_kbps = 0;
+        let mut changed = Vec::new();
+        for (slot, &i) in videos.iter().enumerate() {
+            let rids = rids_of(&sub.out[i].track_id);
+            let target = rids.get(chosen[slot]).copied();
+            desired_kbps += layers::LAYER_KBPS[demands[slot].requested_layer().min(2)];
+            let out = &mut sub.out[i];
+            if out.target_rid != target {
+                out.target_rid = target;
+                changed.push((out.publisher_id.clone(), out.track_id.clone(), target));
+            }
+        }
+        // Let the estimator probe up to what the receiver asked for.
+        if desired_kbps > 0 {
+            sub.peer
+                .rtc
+                .bwe()
+                .set_bitrate(Bitrate::kbps(300), Bitrate::kbps(desired_kbps + 100));
+            sub.peer.wake(Instant::now());
+        }
+        for (publisher_id, track_id, rid) in changed {
+            self.request_keyframe(&publisher_id, &track_id, rid, KeyframeRequestKind::Pli);
+        }
+    }
+
+    /// Tears down both peers of a participant and unpublishes its tracks.
+    pub(super) fn close_media(&mut self, index: usize) {
+        let sockets = self.services.sockets.clone();
+        let participant = &mut self.participants[index];
+        if let Some(mut peer) = participant.publisher.take() {
+            peer.close(&sockets);
+        }
+        if let Some(mut sub) = participant.subscriber.take() {
+            sub.peer.close(&sockets);
+        }
+        self.unpublish(index, None);
+    }
+
+    pub(super) fn media_housekeeping(&mut self, now: Instant) {
+        // Re-send unanswered offers.
+        for index in 0..self.participants.len() {
+            let Some(sub) = self.participants[index].subscriber.as_mut() else {
+                continue;
+            };
+            if sub
+                .pending
+                .as_ref()
+                .is_some_and(|p| now - p.sent_at >= OFFER_TIMEOUT)
+            {
+                sub.pending = None;
+                revert_pending(sub);
+                self.negotiate(index);
+            }
+        }
+
+        // Safety net: picks up any change whose caller did not negotiate.
+        self.negotiate_all();
+        for index in 0..self.participants.len() {
+            self.allocate_layers(index);
+        }
+
+        if now - self.last_speaker_check >= SPEAKER_WINDOW {
+            self.last_speaker_check = now;
+            self.update_speakers();
+        }
+    }
+
+    fn update_speakers(&mut self) {
+        let mut levels: Vec<(String, f32)> = Vec::new();
+        for participant in &mut self.participants {
+            if participant.level_count > 0 {
+                let average = participant.level_sum / participant.level_count as f32;
+                if average >= SPEAKING_LEVEL {
+                    levels.push((participant.id.clone(), average));
+                }
+            }
+            participant.level_sum = 0.0;
+            participant.level_count = 0;
+        }
+        levels.sort_by(|a, b| b.1.total_cmp(&a.1));
+        levels.truncate(3);
+        let ids: Vec<String> = levels.iter().map(|(id, _)| id.clone()).collect();
+        if ids != self.speakers {
+            self.speakers = ids;
+            let speakers: Vec<_> = levels
+                .iter()
+                .map(|(id, level)| json!({"participant_id": id, "level": (level * 100.0).round() / 100.0}))
+                .collect();
+            let event = Outbound::event("speakers.changed", json!({"speakers": speakers}));
+            for participant in &self.participants {
+                participant.send(event.clone());
+            }
+        }
+    }
+}
+
+/// A track a subscriber should receive.
+struct Desired {
+    track_id: String,
+    publisher_id: String,
+    kind: MediaKind,
+    source: TrackSource,
+    quality: Quality,
+    lowest_rid: Option<Rid>,
+}
+
+/// Undoes the state transitions of an offer that will never be answered.
+fn revert_pending(sub: &mut Subscriber) {
+    for out in &mut sub.out {
+        match out.state {
+            OutState::Negotiating(_) => out.state = OutState::ToOpen,
+            OutState::NegotiatingStop(mid) => out.state = OutState::ToStop(mid),
+            _ => {}
+        }
+    }
+}
+
+fn validate_tracks(tracks: &[OfferedTrack]) -> Result<(), ProtocolError> {
+    let bad = |m: &str| Err(ProtocolError::new(ErrorCode::BadRequest, m.to_owned()));
+    if tracks.len() > 4 {
+        return bad("at most 4 published tracks");
+    }
+    let mut sources = HashSet::new();
+    let mut mids = HashSet::new();
+    for track in tracks {
+        if !sources.insert(track.source) || !mids.insert(&track.mid) {
+            return bad("duplicate source or mid");
+        }
+        if track.mid.is_empty() || track.mid.len() > 16 {
+            return bad("mid must be 1..=16 characters");
+        }
+        if track.layers.len() > 3 || (!track.source.is_video() && !track.layers.is_empty()) {
+            return bad("only video tracks may have up to 3 simulcast layers");
+        }
+        if track
+            .layers
+            .iter()
+            .any(|r| r.is_empty() || r.len() > 8 || !r.bytes().all(|b| b.is_ascii_alphanumeric()))
+        {
+            return bad("rid must be 1..=8 alphanumeric characters");
+        }
+    }
+    Ok(())
+}

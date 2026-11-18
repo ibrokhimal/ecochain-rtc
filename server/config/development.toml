@@ -1,0 +1,27 @@
+# Local development. Never expose this configuration to the internet:
+# it serves plain ws://, uses inline secrets and enables /v1/dev/token.
+mode = "development"
+
+[http]
+bind = "0.0.0.0:7880"
+
+[auth]
+issuer = "ecochain-dev"
+token_secret = "dev-only-token-secret-change-me-0123456789"
+admin_key = "dev-only-admin-key"
+
+[rooms]
+auto_create = true
+default_max_participants = 25
+max_participants_limit = 100
+max_video_subscriptions = 9
+reconnect_grace_secs = 30
+empty_room_ttl_secs = 60
+
+[media]
+udp_port = 7882
+# Empty list: the primary LAN address and 127.0.0.1 are used, so phones on
+# the same Wi-Fi, the iOS Simulator and the Android emulator (via the LAN IP)
+# can connect.
+listen = []
+ice_servers = []
