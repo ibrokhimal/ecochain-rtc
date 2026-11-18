@@ -23,7 +23,6 @@ use participant::Participant;
 use rand::{distributions::Alphanumeric, Rng};
 use serde_json::{json, Value};
 use std::{
-    collections::HashSet,
     sync::{atomic::Ordering, Arc, Weak},
     time::{Duration, Instant},
 };
@@ -151,7 +150,6 @@ pub fn spawn(
         speakers: Vec::new(),
         last_speaker_check: Instant::now(),
         ended: false,
-        removed_identities: HashSet::new(),
     };
     tokio::spawn(room.run(commands_rx, packets_rx, handle.clone()));
     handle
@@ -168,10 +166,6 @@ pub(crate) struct Room {
     speakers: Vec<String>,
     last_speaker_check: Instant,
     ended: bool,
-    /// Identities the host removed. Their tokens stay valid until `exp`, so
-    /// without this list a removed participant could rejoin immediately.
-    /// Kept for the lifetime of the room.
-    removed_identities: HashSet<String>,
 }
 
 impl Room {
@@ -319,7 +313,14 @@ impl Room {
                 "the meeting has ended",
             ));
         }
-        if self.removed_identities.contains(&claims.sub) {
+        // Removed participants keep valid tokens until `exp`; the registry
+        // remembers the removal, even across room re-creation.
+        if self
+            .services
+            .rooms
+            .upgrade()
+            .is_some_and(|rooms| rooms.is_removed(&self.id, &claims.sub))
+        {
             return Err(ProtocolError::new(
                 ErrorCode::Forbidden,
                 "removed from this meeting by the host",
@@ -513,8 +514,9 @@ impl Room {
             After::EndRoom => self.end("ended_by_host"),
             After::Remove(target) => {
                 if let Some(target) = self.participants.iter().position(|p| p.id == target) {
-                    self.removed_identities
-                        .insert(self.participants[target].identity.clone());
+                    if let Some(rooms) = self.services.rooms.upgrade() {
+                        rooms.mark_removed(&self.id, &self.participants[target].identity);
+                    }
                     let participant = &self.participants[target];
                     participant.send(Outbound::event(
                         "removed",

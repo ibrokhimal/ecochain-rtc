@@ -366,6 +366,19 @@ async fn host_can_remove_participant_and_duplicate_requests_are_not_repeated() {
         .await
         .unwrap_err();
     assert_eq!(error.code(), Some(ErrorCode::Forbidden));
+    // Still refused after the room closes when empty and is re-created.
+    host.request("leave", json!({})).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(server.metric("ecochain_rtc_rooms_active"), 0);
+    let mut later = server.signal().await;
+    let error = later
+        .request(
+            "join",
+            json!({"token": server.token("kick", "guest", Role::Participant)}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Some(ErrorCode::Forbidden));
 }
 
 #[tokio::test]

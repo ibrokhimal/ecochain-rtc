@@ -24,6 +24,10 @@ pub struct Rooms {
     me: Weak<Rooms>,
     running: Mutex<HashMap<String, RoomHandle>>,
     ended: Mutex<HashMap<String, Instant>>,
+    /// `(room id, identity)` pairs removed by a host. Kept here rather than
+    /// in the room task so the ban survives the room closing when empty and
+    /// being created again on the next join.
+    removed: Mutex<HashMap<(String, String), Instant>>,
 }
 
 impl Rooms {
@@ -36,6 +40,7 @@ impl Rooms {
             me: me.clone(),
             running: Mutex::default(),
             ended: Mutex::default(),
+            removed: Mutex::default(),
         })
     }
 
@@ -131,6 +136,28 @@ impl Rooms {
         let now = Instant::now();
         ended.retain(|_, at| now - *at < keep);
         ended.insert(room_id.to_owned(), now);
+    }
+
+    /// Remembers that the host removed `identity` from `room_id`.
+    ///
+    /// Kept for `rooms.ended_room_memory_secs` (default 24 h); room tokens
+    /// should be issued with a shorter lifetime than that.
+    pub fn mark_removed(&self, room_id: &str, identity: &str) {
+        let keep = Duration::from_secs(self.config.rooms.ended_room_memory_secs);
+        let mut removed = self.removed.lock().expect("rooms lock");
+        let now = Instant::now();
+        removed.retain(|_, at| now - *at < keep);
+        removed.insert((room_id.to_owned(), identity.to_owned()), now);
+    }
+
+    /// Whether the host removed `identity` from `room_id` recently.
+    pub fn is_removed(&self, room_id: &str, identity: &str) -> bool {
+        let keep = Duration::from_secs(self.config.rooms.ended_room_memory_secs);
+        self.removed
+            .lock()
+            .expect("rooms lock")
+            .get(&(room_id.to_owned(), identity.to_owned()))
+            .is_some_and(|at| at.elapsed() < keep)
     }
 
     /// Whether `room_id` was ended recently.

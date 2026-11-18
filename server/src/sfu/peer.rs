@@ -188,37 +188,97 @@ fn receive(datagram: &Datagram) -> Option<Receive<'_>> {
 /// Whether STUN checks may be sent to `candidate`.
 ///
 /// Always rejected: non-UDP (the SFU only listens on UDP), port 0,
-/// unspecified, multicast and broadcast addresses. Loopback, private,
-/// link-local and IPv6 unique-local addresses are only accepted when
-/// `allow_private` is set (development, where clients share the LAN).
+/// unspecified, multicast and broadcast addresses. Addresses that are not
+/// globally routable (loopback, private, link-local, carrier-grade NAT,
+/// benchmarking, reserved, IPv6 unique-local and site-local) are only
+/// accepted when `allow_private` is set (development on a LAN).
+///
+/// IPv6 forms that embed an IPv4 address (mapped, compatible, NAT64
+/// `64:ff9b::/96`, 6to4 `2002::/16`) are judged by the embedded address,
+/// so they cannot be used to smuggle an internal IPv4 target.
 pub fn is_allowed_remote(candidate: &Candidate, allow_private: bool) -> bool {
-    use std::net::IpAddr;
     let addr = candidate.addr();
     if candidate.proto() != Protocol::Udp || addr.port() == 0 {
         return false;
     }
-    let ip = addr.ip();
-    if ip.is_unspecified() || ip.is_multicast() {
-        return false;
+    match classify(addr.ip()) {
+        AddressClass::Never => false,
+        AddressClass::Internal => allow_private,
+        AddressClass::Global => true,
     }
-    let internal = match ip {
-        IpAddr::V4(v4) => {
-            if v4.is_broadcast() {
-                return false;
-            }
-            v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.octets()[0] == 0
-        }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AddressClass {
+    /// Never a valid unicast peer.
+    Never,
+    /// Not globally routable.
+    Internal,
+    /// Globally routable unicast.
+    Global,
+}
+
+fn classify(ip: std::net::IpAddr) -> AddressClass {
+    use std::net::{IpAddr, Ipv4Addr};
+    let v4 = match ip {
+        IpAddr::V4(v4) => v4,
         IpAddr::V6(v6) => {
-            let first = v6.segments()[0];
-            v6.is_loopback()
-                || (first & 0xfe00) == 0xfc00 // unique local fc00::/7
-                || (first & 0xffc0) == 0xfe80 // link local fe80::/10
-                || v6.to_ipv4_mapped().is_some_and(|v4| {
-                    v4.is_loopback() || v4.is_private() || v4.is_link_local()
-                })
+            let seg = v6.segments();
+            let octets = v6.octets();
+            let embedded = if let Some(v4) = v6.to_ipv4_mapped() {
+                Some(v4)
+            } else if seg[..6] == [0; 6] && !v6.is_loopback() && !v6.is_unspecified() {
+                // IPv4-compatible ::a.b.c.d (deprecated, still parsed).
+                Some(Ipv4Addr::new(
+                    octets[12], octets[13], octets[14], octets[15],
+                ))
+            } else if seg[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+                // NAT64 well-known prefix.
+                Some(Ipv4Addr::new(
+                    octets[12], octets[13], octets[14], octets[15],
+                ))
+            } else if seg[0] == 0x2002 {
+                // 6to4: 2002:aabb:ccdd::/48.
+                Some(Ipv4Addr::new(octets[2], octets[3], octets[4], octets[5]))
+            } else {
+                None
+            };
+            if let Some(v4) = embedded {
+                v4
+            } else {
+                if v6.is_unspecified() || v6.is_multicast() {
+                    return AddressClass::Never;
+                }
+                let internal = v6.is_loopback()
+                    || (seg[0] & 0xfe00) == 0xfc00 // unique local fc00::/7
+                    || (seg[0] & 0xffc0) == 0xfe80 // link local fe80::/10
+                    || (seg[0] & 0xffc0) == 0xfec0 // site local fec0::/10 (deprecated)
+                    || (seg[0] & 0xe000) != 0x2000; // outside global unicast 2000::/3
+                return if internal {
+                    AddressClass::Internal
+                } else {
+                    AddressClass::Global
+                };
+            }
         }
     };
-    allow_private || !internal
+    let [a, b, ..] = v4.octets();
+    if v4.is_unspecified() || v4.is_multicast() || v4.is_broadcast() {
+        return AddressClass::Never;
+    }
+    let internal = v4.is_loopback()
+        || v4.is_private()
+        || v4.is_link_local()
+        || a == 0 // "this network" 0.0.0.0/8
+        || (a == 100 && (64..128).contains(&b)) // carrier-grade NAT 100.64.0.0/10
+        || (a == 192 && b == 0 && v4.octets()[2] == 0) // IETF protocol assignments 192.0.0.0/24
+        || (a == 198 && (b == 18 || b == 19)) // benchmarking 198.18.0.0/15
+        || a >= 240; // reserved 240.0.0.0/4
+    if internal {
+        AddressClass::Internal
+    } else {
+        AddressClass::Global
+    }
 }
 
 /// Parses a trickled candidate. Accepts the line with or without the
@@ -240,12 +300,12 @@ mod tests {
 
     #[test]
     fn rejects_unsafe_candidates() {
-        let public = candidate("candidate:1 1 udp 2122260223 203.0.113.7 50000 typ host");
+        let public = candidate("candidate:1 1 udp 2122260223 1.1.1.1 50000 typ host");
         let private = candidate("candidate:1 1 udp 2122260223 192.168.1.20 50000 typ host");
         let loopback = candidate("candidate:1 1 udp 2122260223 127.0.0.1 50000 typ host");
         let metadata = candidate("candidate:1 1 udp 2122260223 169.254.169.254 80 typ host");
         let unique_local = candidate("candidate:1 1 udp 2122260223 fd00::1 50000 typ host");
-        let tcp = candidate("candidate:1 1 tcp 1518280447 203.0.113.7 9 typ host tcptype active");
+        let tcp = candidate("candidate:1 1 tcp 1518280447 1.1.1.1 9 typ host tcptype active");
 
         assert!(is_allowed_remote(&public, false));
         for internal in [&private, &loopback, &metadata, &unique_local] {
@@ -253,5 +313,42 @@ mod tests {
             assert!(is_allowed_remote(internal, true), "dev allows {internal:?}");
         }
         assert!(!is_allowed_remote(&tcp, true));
+    }
+
+    #[test]
+    fn classifies_embedded_and_special_ranges() {
+        use std::net::IpAddr;
+        let class = |s: &str| classify(s.parse::<IpAddr>().unwrap());
+        for internal in [
+            "::ffff:127.0.0.1",   // mapped
+            "::10.0.0.1",         // compatible
+            "64:ff9b::a9fe:a9fe", // NAT64 of 169.254.169.254
+            "2002:c0a8:0101::1",  // 6to4 of 192.168.1.1
+            "fec0::1",            // site local
+            "100.64.0.1",         // CGNAT
+            "198.18.0.1",         // benchmarking
+            "240.0.0.1",          // reserved
+            "192.0.0.8",
+        ] {
+            assert_eq!(class(internal), AddressClass::Internal, "{internal}");
+        }
+        for never in [
+            "0.0.0.0",
+            "255.255.255.255",
+            "224.0.0.1",
+            "::",
+            "ff02::1",
+            "::ffff:224.0.0.1",
+        ] {
+            assert_eq!(class(never), AddressClass::Never, "{never}");
+        }
+        for global in [
+            "1.1.1.1",
+            "2606:4700:4700::1111",
+            "64:ff9b::808:808",
+            "2002:0808:0808::1",
+        ] {
+            assert_eq!(class(global), AddressClass::Global, "{global}");
+        }
     }
 }
