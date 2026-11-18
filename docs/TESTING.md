@@ -75,7 +75,7 @@ Ikkala qurilma bitta iPhone hotspot’ida: trafik Mac → iPhone → Linux yo‘
 * `EAGAIN` (os 11): Wi‑Fi qisqa to‘xtaganda ~200 KB lik standart socket yuborish buferi to‘lib, keyingi paketlar tashlanardi. **Tuzatildi:** media socket’lar 4 MiB bufer so‘raydi (kernel `net.core.wmem_max` gacha cheklaydi). Faqat audio, 2 bot: yetkazish **43% → 100%**, `send_error` 0.
 * `EINVAL` (os 22): ICE loopback socket’idan LAN manzilga tekshiruv yuborardi. Endi bunday juftliklar o‘tkazib yuboriladi.
 
-Video bilan bot sinovlari bu tarmoqda o‘lchov emas: har bot simulcast’da ~2,15 Mbit/s yuboradi (BWE’ga moslashmaydi), bu hotspot sig‘imidan katta. Botlar audio 5–75% oladi, server esa yuklama ostida emas (loopback’da xuddi shu yuklama 100%). Haqiqiy klientlar TWCC/BWE bilan sifatni pasaytiradi. Yuklama sinovini router orqali LAN’da yoki kabelda o‘tkazish kerak. Linux’da power save’ni o‘chirish tavsiya etiladi (`sudo iw dev wlp0s20f3 set power_save off` yoki NetworkManager’da `wifi.powersave = 2`).
+Video bilan bot sinovlari bu tarmoqda o‘lchov emas: har bot simulcast’da ~2,15 Mbit/s yuboradi (BWE’ga moslashmaydi), bu hotspot sig‘imidan katta. Botlar audio 5–75% oladi, server esa yuklama ostida emas (loopback’da xuddi shu yuklama 100%). Haqiqiy klientlar TWCC/BWE bilan sifatni pasaytiradi. Yuklama sinovini router orqali LAN’da yoki kabelda o‘tkazish kerak. Linux’da power save’ni o‘chirish tavsiya etiladi (`sudo iwconfig wlp0s20f3 power off` yoki NetworkManager’da `wifi.powersave = 2`).
 
 Sinov paytida topilgan va tuzatilgan muammolar:
 
