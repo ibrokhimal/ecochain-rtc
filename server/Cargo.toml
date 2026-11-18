@@ -3,6 +3,7 @@ name = "ecochain-rtc-server"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.89"
+default-run = "ecochain-rtc-server"
 license = "Proprietary"
 description = "Ecochain signaling server and WebRTC SFU built on str0m"
 
