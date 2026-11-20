@@ -165,6 +165,7 @@ pub fn spawn(
         speakers: Vec::new(),
         last_speakers_sent: None,
         speakers_due: None,
+        keyframes_due: None,
         ended: false,
     };
     tokio::spawn(room.run(commands_rx, packets_rx, handle.clone()));
@@ -200,6 +201,8 @@ pub(crate) struct Room {
     last_speakers_sent: Option<Instant>,
     /// A speaker change held back by the throttle is sent at this time.
     speakers_due: Option<Instant>,
+    /// Earliest deferred keyframe request of any track (may be stale-early).
+    keyframes_due: Option<Instant>,
     ended: bool,
 }
 

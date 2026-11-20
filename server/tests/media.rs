@@ -439,6 +439,7 @@ async fn switching_to_another_video_shows_frame_quickly() {
     tokio::time::sleep(Duration::from_millis(700)).await;
 
     let start = Instant::now();
+    let requests_before = carol.stats().keyframe_requests;
     bob.subscribe_video(track_id, "high");
     assert!(
         bob.wait_for(Duration::from_secs(1), |s| first_frame_from(s, &carol_id))
@@ -447,6 +448,15 @@ async fn switching_to_another_video_shows_frame_quickly() {
         bob.stats()
     );
     eprintln!("switch to first frame: {:?}", start.elapsed());
+    // One subscription asks for at most one keyframe per layer; a deferred
+    // request must not fire again after the keyframe arrived.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let requests = carol.stats().keyframe_requests - requests_before;
+    assert!(
+        requests <= 3,
+        "{requests} keyframe requests for one subscription"
+    );
+    eprintln!("keyframe requests for one subscription: {requests}");
     alice.leave().await;
     bob.leave().await;
     carol.leave().await;

@@ -60,7 +60,7 @@ impl Room {
         if let Some(due) = self.speakers_due {
             next = next.min(due);
         }
-        if let Some(due) = self.keyframes_due() {
+        if let Some(due) = self.keyframes_due {
             next = next.min(due);
         }
         for participant in &self.participants {
@@ -825,6 +825,13 @@ impl Room {
         let Some(track) = publisher.tracks.iter_mut().find(|t| t.mid == data.mid) else {
             return;
         };
+        if data.is_keyframe() {
+            // The deferred request, if any, is satisfied. Never inserts: the
+            // rid comes from the network.
+            if let Some(gate) = track.keyframes.get_mut(&data.rid) {
+                gate.keyframe_received();
+            }
+        }
         if data.ext_vals.video_orientation.is_some() {
             track.orientation = data.ext_vals.video_orientation;
         }
@@ -971,8 +978,16 @@ impl Room {
         let Some(track) = participant.tracks.iter_mut().find(|t| t.id == track_id) else {
             return;
         };
+        // Only layers the track really has: the rid may come from the network.
+        if !super::keyframe::is_known_layer(&track.layers, rid) {
+            return;
+        }
         let now = Instant::now();
-        if !track.keyframes.entry(rid).or_default().request(now, urgent) {
+        let gate = track.keyframes.entry(rid).or_default();
+        if !gate.request(now, urgent) {
+            if let Some(due) = gate.due() {
+                self.keyframes_due = Some(self.keyframes_due.map_or(due, |d| d.min(due)));
+            }
             return;
         }
         let mid = track.mid;
@@ -999,6 +1014,10 @@ impl Room {
 
     /// Sends the keyframe requests whose deferral has ended.
     pub(super) fn flush_keyframes(&mut self, now: Instant) {
+        if self.keyframes_due.is_none_or(|due| due > now) {
+            return;
+        }
+        let mut next: Option<Instant> = None;
         for participant in &mut self.participants {
             let mut due = Vec::new();
             for track in &mut participant.tracks {
@@ -1006,21 +1025,16 @@ impl Room {
                     if gate.take_due(now) {
                         due.push((track.mid, *rid));
                     }
+                    if let Some(at) = gate.due() {
+                        next = Some(next.map_or(at, |n| n.min(at)));
+                    }
                 }
             }
             for (mid, rid) in due {
                 Self::send_keyframe_request(participant, mid, rid, KeyframeRequestKind::Pli, now);
             }
         }
-    }
-
-    fn keyframes_due(&self) -> Option<Instant> {
-        self.participants
-            .iter()
-            .flat_map(|p| &p.tracks)
-            .flat_map(|t| t.keyframes.values())
-            .filter_map(|g| g.due())
-            .min()
+        self.keyframes_due = next;
     }
 
     /// Picks the simulcast layer per forwarded video track from requested

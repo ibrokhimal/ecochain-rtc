@@ -11,17 +11,36 @@ pub const KEYFRAME_THROTTLE: Duration = Duration::from_millis(500);
 /// Spacing for urgent requests (new subscription, layer switch).
 pub const KEYFRAME_THROTTLE_URGENT: Duration = Duration::from_millis(150);
 
+/// Whether `rid` names a layer of a track (`None` only for non-simulcast).
+pub fn is_known_layer<R: PartialEq>(layers: &[R], rid: Option<R>) -> bool {
+    match rid {
+        None => layers.is_empty(),
+        Some(r) => layers.contains(&r),
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct KeyframeGate {
     last: Option<Instant>,
     due: Option<Instant>,
+    /// When the short urgent window was last used. It is available at most
+    /// once per `KEYFRAME_THROTTLE`, so churning subscriptions cannot drive
+    /// a request every 150 ms.
+    urgent_used: Option<Instant>,
 }
 
 impl KeyframeGate {
     /// `true` = send now (and it is recorded as sent); `false` = a request was
     /// scheduled for when the throttle window ends.
     pub fn request(&mut self, now: Instant, urgent: bool) -> bool {
-        let window = if urgent {
+        let fast = urgent
+            && self
+                .urgent_used
+                .is_none_or(|at| now.saturating_duration_since(at) >= KEYFRAME_THROTTLE);
+        if fast {
+            self.urgent_used = Some(now);
+        }
+        let window = if fast {
             KEYFRAME_THROTTLE_URGENT
         } else {
             KEYFRAME_THROTTLE
@@ -42,6 +61,11 @@ impl KeyframeGate {
 
     pub fn due(&self) -> Option<Instant> {
         self.due
+    }
+
+    /// A keyframe arrived: a deferred request is no longer needed.
+    pub fn keyframe_received(&mut self) {
+        self.due = None;
     }
 
     /// `true` if a deferred request is due; it is then recorded as sent.
@@ -92,6 +116,33 @@ mod tests {
         let (mut gate, t0) = (KeyframeGate::default(), Instant::now());
         assert!(gate.request(t0, false));
         assert!(gate.request(t0 + ms(160), true));
+    }
+
+    #[test]
+    fn urgent_fast_path_is_used_once_per_window() {
+        let (mut gate, t0) = (KeyframeGate::default(), Instant::now());
+        assert!(gate.request(t0, true));
+        assert!(!gate.request(t0 + ms(200), true));
+        assert_eq!(gate.due(), Some(t0 + ms(500)));
+    }
+
+    #[test]
+    fn keyframe_cancels_deferred_request() {
+        let (mut gate, t0) = (KeyframeGate::default(), Instant::now());
+        assert!(gate.request(t0, true));
+        assert!(!gate.request(t0 + ms(10), false));
+        gate.keyframe_received();
+        assert_eq!(gate.due(), None);
+        assert!(!gate.take_due(t0 + ms(600)));
+    }
+
+    #[test]
+    fn unknown_rid_is_not_a_layer() {
+        assert!(is_known_layer::<u8>(&[], None));
+        assert!(!is_known_layer::<u8>(&[], Some(1)));
+        assert!(is_known_layer(&[1, 2, 3], Some(2)));
+        assert!(!is_known_layer(&[1, 2, 3], Some(9)));
+        assert!(!is_known_layer(&[1, 2, 3], None));
     }
 
     #[test]
