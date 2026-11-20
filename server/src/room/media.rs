@@ -75,23 +75,52 @@ impl Room {
     }
 
     pub(super) fn handle_datagram(&mut self, datagram: Datagram) {
-        for index in 0..self.participants.len() {
-            for kind in [PeerKind::Publisher, PeerKind::Subscriber] {
-                let Some(peer) = self.peer_mut(index, kind) else {
-                    continue;
-                };
-                if peer.accepts(&datagram) {
-                    if let Err(e) = peer.handle_datagram(&datagram) {
-                        tracing::debug!(error = ?e, "peer rejected datagram");
-                        self.fail_peer(index, kind);
-                    }
+        // Fast path: the source address was seen before. The cached peer is
+        // always verified with `accepts`, so a stale entry only costs a scan.
+        let cached = self.routes.get(&datagram.source).cloned();
+        if let Some((participant_id, kind)) = cached {
+            if let Some(index) = self.index_of(&participant_id) {
+                if self.deliver(index, kind, &datagram) {
                     return;
                 }
             }
         }
+        for index in 0..self.participants.len() {
+            for kind in [PeerKind::Publisher, PeerKind::Subscriber] {
+                if self.deliver(index, kind, &datagram) {
+                    let id = self.participants[index].id.clone();
+                    self.routes.insert(datagram.source, (id, kind));
+                    return;
+                }
+            }
+        }
+        self.routes.remove(&datagram.source);
         self.services
             .metrics
             .udp_dropped(crate::metrics::UdpDrop::NoPeer);
+    }
+
+    /// Hands the datagram to the peer if it accepts it. Returns whether it did.
+    fn deliver(&mut self, index: usize, kind: PeerKind, datagram: &Datagram) -> bool {
+        let Some(peer) = self.peer_mut(index, kind) else {
+            return false;
+        };
+        if !peer.accepts(datagram) {
+            return false;
+        }
+        if let Err(e) = peer.handle_datagram(datagram) {
+            tracing::debug!(error = ?e, "peer rejected datagram");
+            self.fail_peer(index, kind);
+        }
+        true
+    }
+
+    /// Drops cached routes to a participant's peers (`None` = both). Called
+    /// wherever a peer is closed or replaced, and on participant removal, which
+    /// also keeps the cache bounded.
+    pub(super) fn forget_routes(&mut self, participant_id: &str, kind: Option<PeerKind>) {
+        self.routes
+            .retain(|_, (id, k)| !(id == participant_id && kind.is_none_or(|kind| kind == *k)));
     }
 
     /// Advances all peers, sends their datagrams and processes their events
@@ -159,6 +188,8 @@ impl Room {
             .peer_failures_total
             .fetch_add(1, Ordering::Relaxed);
         let sockets = self.services.sockets.clone();
+        let participant_id = self.participants[index].id.clone();
+        self.forget_routes(&participant_id, Some(kind));
         let target = match kind {
             PeerKind::Publisher => {
                 if let Some(mut peer) = self.participants[index].publisher.take() {
@@ -247,6 +278,8 @@ impl Room {
 
         let sockets = self.services.sockets.clone();
         if reset {
+            let participant_id = self.participants[index].id.clone();
+            self.forget_routes(&participant_id, Some(PeerKind::Publisher));
             if let Some(mut old) = self.participants[index].publisher.take() {
                 old.close(&sockets);
             }
@@ -409,6 +442,8 @@ impl Room {
     }
 
     pub(super) fn reset_subscriber(&mut self, index: usize) {
+        let participant_id = self.participants[index].id.clone();
+        self.forget_routes(&participant_id, Some(PeerKind::Subscriber));
         if let Some(mut old) = self.participants[index].subscriber.take() {
             old.peer.close(&self.services.sockets);
         }
@@ -923,6 +958,8 @@ impl Room {
 
     /// Tears down both peers of a participant and unpublishes its tracks.
     pub(super) fn close_media(&mut self, index: usize) {
+        let participant_id = self.participants[index].id.clone();
+        self.forget_routes(&participant_id, None);
         let sockets = self.services.sockets.clone();
         let participant = &mut self.participants[index];
         if let Some(mut peer) = participant.publisher.take() {

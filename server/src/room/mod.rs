@@ -17,12 +17,17 @@ use crate::{
     metrics::Metrics,
     protocol::{close_code, ErrorCode, Outbound, ProtocolError, SessionRequest},
     rooms::Rooms,
-    sfu::udp::{Datagram, MediaSockets, RoomPackets},
+    sfu::{
+        peer::PeerKind,
+        udp::{Datagram, MediaSockets, RoomPackets},
+    },
 };
 use participant::Participant;
 use rand::{distributions::Alphanumeric, Rng};
 use serde_json::{json, Value};
 use std::{
+    collections::HashMap,
+    net::SocketAddr,
     sync::{atomic::Ordering, Arc, Weak},
     time::{Duration, Instant},
 };
@@ -145,6 +150,7 @@ pub fn spawn(
         services,
         packets_tx,
         participants: Vec::new(),
+        routes: HashMap::new(),
         empty_since: Some(Instant::now()),
         empty_ttl_override: from_api.then_some(UNUSED_ROOM_TTL),
         speakers: Vec::new(),
@@ -161,6 +167,9 @@ pub(crate) struct Room {
     services: RoomServices,
     packets_tx: RoomPackets,
     participants: Vec<Participant>,
+    /// Source address -> owning peer, learned from datagrams. Only a hint:
+    /// every hit is verified with `Peer::accepts`.
+    routes: HashMap<SocketAddr, (String, PeerKind)>,
     empty_since: Option<Instant>,
     empty_ttl_override: Option<Duration>,
     speakers: Vec<String>,
@@ -680,6 +689,7 @@ impl Room {
     fn remove_participant(&mut self, index: usize, reason: Option<&str>) {
         self.close_media(index);
         let participant = self.participants.remove(index);
+        self.forget_routes(&participant.id, None);
         self.services
             .metrics
             .participants_active

@@ -122,3 +122,49 @@ async fn room_busy_metric_grows() {
     alice.leave().await;
     bob.leave().await;
 }
+
+#[tokio::test]
+async fn media_keeps_flowing_after_another_participant_leaves() {
+    let server = common::start("").await;
+    let a = Bot::start(server.bot("leaver", "a")).await.unwrap();
+    let b = Bot::start(server.bot("leaver", "b")).await.unwrap();
+    let c = Bot::start(server.bot("leaver", "c")).await.unwrap();
+    let flowing = |s: &ecochain_rtc_server::bot::BotStats| {
+        s.audio_frames_by_participant.len() == 2 && s.audio_frames > 50
+    };
+    for bot in [&a, &b, &c] {
+        assert!(
+            bot.wait_for(Duration::from_secs(10), flowing).await,
+            "{:?}",
+            bot.stats()
+        );
+    }
+    let a_id = a.stats().participant_id.clone().unwrap();
+    let c_id = c.stats().participant_id.clone().unwrap();
+    let a_from_c = a.stats().audio_frames_by_participant[&c_id];
+    let a_video_from_c = a
+        .stats()
+        .video_frames_by_participant
+        .get(&c_id)
+        .copied()
+        .unwrap_or(0);
+    let c_from_a = c.stats().audio_frames_by_participant[&a_id];
+    let c_video_from_a = c
+        .stats()
+        .video_frames_by_participant
+        .get(&a_id)
+        .copied()
+        .unwrap_or(0);
+
+    b.leave().await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let a_stats = a.stats();
+    let c_stats = c.stats();
+    assert!(a_stats.audio_frames_by_participant[&c_id] > a_from_c + 40);
+    assert!(c_stats.audio_frames_by_participant[&a_id] > c_from_a + 40);
+    assert!(a_stats.video_frames_by_participant[&c_id] > a_video_from_c);
+    assert!(c_stats.video_frames_by_participant[&a_id] > c_video_from_a);
+    a.leave().await;
+    c.leave().await;
+}

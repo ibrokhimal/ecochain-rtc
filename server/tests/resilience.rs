@@ -86,6 +86,27 @@ async fn network_switch_restarts_ice() {
 }
 
 #[tokio::test]
+async fn stale_route_falls_back_to_scan() {
+    // The cached route (old source address) stops matching after a network
+    // switch; the room must fall back to the full scan and relearn it.
+    let server = common::start("").await;
+    let (alice, bob) = pair(&server, "stale-route").await;
+    let switched = Instant::now();
+    alice.switch_network();
+    let to_bob = audio_recovery(&bob, switched).await;
+    let to_alice = audio_recovery(&alice, switched).await;
+    assert!(to_bob < Duration::from_secs(5), "alice->bob {to_bob:?}");
+    assert!(to_alice < Duration::from_secs(5), "bob->alice {to_alice:?}");
+    // And it keeps flowing afterwards.
+    let before = bob.stats().audio_frames;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(bob.stats().audio_frames > before + 40, "{:?}", bob.stats());
+    single_seat(&bob);
+    alice.leave().await;
+    bob.leave().await;
+}
+
+#[tokio::test]
 async fn signaling_drop_keeps_media_flowing() {
     let server = common::start("").await;
     let (alice, bob) = pair(&server, "ws-drop").await;
