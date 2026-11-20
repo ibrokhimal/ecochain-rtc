@@ -6,6 +6,9 @@
 //! processes every command in order, concurrent joins, duplicate requests and
 //! a leave racing a reconnect are resolved deterministically without locks.
 
+// AudioSelector is wired into Room::forward in the next task.
+#[allow(dead_code)]
+mod audio;
 mod media;
 mod participant;
 

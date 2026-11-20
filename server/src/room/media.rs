@@ -7,6 +7,7 @@
 //! sees sequence number gaps, only a keyframe from the new layer.
 
 use super::{
+    audio::SPEAKING_LEVEL,
     participant::{OutState, OutTrack, PendingOffer, PublishedTrack, Subscriber},
     random_id, Room,
 };
@@ -51,10 +52,6 @@ const KEYFRAME_THROTTLE: Duration = Duration::from_millis(500);
 
 /// Window for active speaker detection.
 const SPEAKER_WINDOW: Duration = Duration::from_millis(500);
-
-/// Linear audio level (0..1) above which a participant counts as speaking.
-/// 0.03 is about -30 dBov, quieter than normal speech, louder than room noise.
-const SPEAKING_LEVEL: f32 = 0.03;
 
 /// Upper bound of drive iterations per wakeup, to keep one room from
 /// starving others if events keep producing events.
