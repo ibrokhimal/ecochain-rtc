@@ -238,8 +238,11 @@ fn frames_from(stats: &BotStats, participant_id: &str) -> u64 {
 async fn only_loudest_three_audio_tracks_are_forwarded() {
     let server = common::start("").await;
     let room = "loudest";
+    // -28 dBov is above the speaking threshold (about -30.5), so only the
+    // cap keeps it out: it is within the 6 dB swap margin of -20, and if it
+    // got a slot first, each louder speaker evicts it.
     let mut speakers = Vec::new();
-    for (name, level) in [("a", -10), ("b", -15), ("c", -20), ("quiet", -45)] {
+    for (name, level) in [("a", -10), ("b", -15), ("c", -20), ("quiet", -28)] {
         speakers.push(
             Bot::start(speaker(&server, room, name, level))
                 .await

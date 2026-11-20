@@ -418,7 +418,8 @@ impl Room {
             .ok_or_else(|| {
                 ProtocolError::new(ErrorCode::InvalidState, "source is not published")
             })?;
-        if muted {
+        if muted && track.kind == MediaKind::Audio {
+            // replaceTrack(null) sends nothing more that could release the slot.
             self.audio.remove(&track.id);
         }
         if track.muted != muted {
