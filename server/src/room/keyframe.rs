@@ -8,8 +8,11 @@ use std::time::{Duration, Instant};
 
 /// Minimum spacing of keyframe requests for the same layer.
 pub const KEYFRAME_THROTTLE: Duration = Duration::from_millis(500);
-/// Spacing for urgent requests (new subscription, layer switch).
-pub const KEYFRAME_THROTTLE_URGENT: Duration = Duration::from_millis(150);
+/// Spacing for urgent requests (new subscription, layer switch). Chosen by
+/// measurement: it bounds urgent requests to at most 4/s per layer (6.7/s at
+/// 150 ms, about 20/s per track with the first design) while a subscriber
+/// waits at most 250 ms extra behind a request sent just before its own.
+pub const KEYFRAME_THROTTLE_URGENT: Duration = Duration::from_millis(250);
 
 /// Whether `rid` names a layer of a track (`None` only for non-simulcast).
 pub fn is_known_layer<R: PartialEq>(layers: &[R], rid: Option<R>) -> bool {
@@ -23,24 +26,13 @@ pub fn is_known_layer<R: PartialEq>(layers: &[R], rid: Option<R>) -> bool {
 pub struct KeyframeGate {
     last: Option<Instant>,
     due: Option<Instant>,
-    /// When the short urgent window was last used. It is available at most
-    /// once per `KEYFRAME_THROTTLE`, so churning subscriptions cannot drive
-    /// a request every 150 ms.
-    urgent_used: Option<Instant>,
 }
 
 impl KeyframeGate {
     /// `true` = send now (and it is recorded as sent); `false` = a request was
     /// scheduled for when the throttle window ends.
     pub fn request(&mut self, now: Instant, urgent: bool) -> bool {
-        let fast = urgent
-            && self
-                .urgent_used
-                .is_none_or(|at| now.saturating_duration_since(at) >= KEYFRAME_THROTTLE);
-        if fast {
-            self.urgent_used = Some(now);
-        }
-        let window = if fast {
+        let window = if urgent {
             KEYFRAME_THROTTLE_URGENT
         } else {
             KEYFRAME_THROTTLE
@@ -108,22 +100,23 @@ mod tests {
         let (mut gate, t0) = (KeyframeGate::default(), Instant::now());
         assert!(gate.request(t0, false));
         assert!(!gate.request(t0 + ms(100), true));
-        assert_eq!(gate.due(), Some(t0 + ms(150)));
+        assert_eq!(gate.due(), Some(t0 + ms(250)));
+    }
+
+    #[test]
+    fn urgent_after_urgent_is_deferred_to_short_window() {
+        let (mut gate, t0) = (KeyframeGate::default(), Instant::now());
+        assert!(gate.request(t0, true));
+        assert!(!gate.request(t0 + ms(100), true));
+        assert_eq!(gate.due(), Some(t0 + ms(250)));
+        assert!(gate.request(t0 + ms(260), true) || gate.take_due(t0 + ms(260)));
     }
 
     #[test]
     fn urgent_after_short_throttle_is_sent_now() {
         let (mut gate, t0) = (KeyframeGate::default(), Instant::now());
         assert!(gate.request(t0, false));
-        assert!(gate.request(t0 + ms(160), true));
-    }
-
-    #[test]
-    fn urgent_fast_path_is_used_once_per_window() {
-        let (mut gate, t0) = (KeyframeGate::default(), Instant::now());
-        assert!(gate.request(t0, true));
-        assert!(!gate.request(t0 + ms(200), true));
-        assert_eq!(gate.due(), Some(t0 + ms(500)));
+        assert!(gate.request(t0 + ms(260), true));
     }
 
     #[test]
