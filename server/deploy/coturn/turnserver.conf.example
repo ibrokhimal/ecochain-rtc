@@ -48,7 +48,25 @@ denied-peer-ip=192.0.0.0-192.0.0.255
 denied-peer-ip=192.168.0.0-192.168.255.255
 denied-peer-ip=198.18.0.0-198.19.255.255
 denied-peer-ip=240.0.0.0-255.255.255.255
-# Allow only the SFU media address (advertise_ip of media.listen). If the SFU
+# IPv6: loopback, IPv4-mapped (::ffff:0:0/96), unique-local (fc00::/7) and
+# link-local (fe80::/10). The SFU is UDP/IPv4 only; if your coturn build does
+# not accept IPv6 ranges, turn IPv6 relaying off instead (e.g. bind only IPv4
+# addresses in listening-ip/relay-ip and check `turnserver -h` for your version).
+denied-peer-ip=::1
+denied-peer-ip=::ffff:0.0.0.0-::ffff:255.255.255.255
+denied-peer-ip=fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+denied-peer-ip=fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+# Allow only the SFU media address: <SFU_PUBLIC_IP> must be the SFU's
+# `advertise_ip` (the address clients/coturn reach it on), or its private IP
+# when TURN and SFU share one network. If the SFU
 # is on a private address of the same network, allowed-peer-ip takes
 # precedence over denied-peer-ip, so list that exact address here.
 allowed-peer-ip=<SFU_PUBLIC_IP>
+
+# --- Relay port range and abuse limits ---
+# Open exactly this UDP range in the firewall (coturn host).
+min-port=49152
+max-port=65535
+# Allocations per user (one browser/app needs a few) and for the whole server.
+user-quota=12
+total-quota=1200

@@ -1,6 +1,6 @@
 # Sinov natijalari
 
-Sana: 2026-11-18. Mashina: Apple Silicon Mac (10 yadro), macOS 26, Rust 1.96, Flutter 3.44.1 / Dart 3.12.1.
+Sana: 2026-11-18 (100 kishilik bo‘lim: 2026-11-20). Mashina: Apple Silicon Mac (10 yadro), macOS 26, Rust 1.96, Flutter 3.44.1 / Dart 3.12.1.
 
 ## Buyruqlar
 
@@ -127,6 +127,104 @@ Xulosa:
 * Video uchun 25 kishi × 6 tagacha HQ video har qurilmada — barqaror. 25 × 8 HQ (jami ~225 Mbit/s egress) — bitta xona aktori bitta yadroga yetadi va video kadrlarning ~25% yo‘qoladi. Real ilovada galereya tile’lari `low/medium` qatlam so‘raydi va mobil standart limit 4 ta video, bu konfiguratsiya yuqoridagi barqaror qatorlarga to‘g‘ri keladi.
 * Yuklama paytida topilib tuzatilgan muammolar: `sendto` xona taskining ~40% vaqtini olardi (alohida yuborish thread’i, o‘tkazuvchanlik ×2); `ping` xona taski orqali o‘tib, band xonada sog‘ klientlarni sekinlashtirardi (endi signaling taskida javob beriladi).
 * Bu raqamlar loopback’da, generator bilan bir mashinada olingan. Ikki qurilmali prototip natijasi bilan 25 kishilik sig‘im **alohida**: 25 kishilik sig‘im faqat headless botlar bilan o‘lchandi, 25 ta haqiqiy qurilma bilan sinov o‘tkazilmagan.
+
+## 100 kishilik xona (2026-11-20, `feat/100-participant-rooms`)
+
+**Sharoit (muhim):** Apple Silicon Mac, 10 yadro, release build, **loopback**, generator (`loadtest`) va server bitta mashinada (generator ham CPU oladi, shuning uchun raqamlar serverga nisbatan pessimistik, lekin oraliq jim emas: run’lar orasida chayqalish bor). Spec bo‘yicha hal qiluvchi o‘lchov — 16 yadroli Linux server + LAN orqali alohida generator; u **hali bajarilmagan** (pastdagi “Hali bajarilmagan” bo‘limi).
+
+```bash
+cd server && cargo build --release --bins && ulimit -n 65536
+./target/release/ecochain-rtc-server serve --config config/development.toml &
+curl -X POST http://127.0.0.1:7880/v1/rooms -H 'Authorization: Bearer dev-only-admin-key' \
+  -H 'content-type: application/json' -d '{"room_id":"loadtest","max_participants":100}'
+./target/release/loadtest --config config/development.toml --participants 100 --publishers 2 \
+  --cameras 10 --muted-mics 30 --max-video 4 --high-video 1 --switch-every-secs 5 --seconds 30 \
+  --metrics-url http://127.0.0.1:7880/metrics        # + --unmute-probe: birinchi unmute kechikishi
+```
+
+Ssenariy: 100 ishtirokchi; 2 gapiruvchi (audio + 3 qatlamli video), 10 faqat kamera, 30 muted mikrofon (muzokara qilingan), 58 media’siz; har kishi 4 video, shundan 1 tasi `high`, qolganlari `low`; har 5 s da tinglovchilar bitta video obunani almashtiradi.
+
+### Yakuniy natijalar (100 kishi, 30 s)
+
+| Run | Audio | Video o‘rt./min | Switch p50 / p95 | Room busy |
+| --- | --- | --- | --- | --- |
+| 1 | 100% | 99,9% / 97,7% | 186 / **655 ms** | **76,6%** |
+| 2 | 100% | 100% / 99,8% | 78 / 333 ms | 58,3% |
+| 3 | 100% | 100% / 99,8% | 77 / 342 ms | 59,0% |
+| 4 (qayta) | 100% | 100% / 99,9% | 79 / 111 ms | 59,0% |
+| 5 (`--unmute-probe`) | 100% (*) | 100% / 99,8% | 88 / 335 ms | 60,4% |
+
+(*) probe qo‘shimcha audio keltirgani uchun “kutilgan”dan oshadi (avg 146,9%). Birinchi unmute eshitilishi (n=99 tinglovchi): **p50 190 ms, p95 356 ms** (faqat o‘lchandi; spec bo‘yicha mezon emas, baseline p95 288 ms edi).
+
+Run 1 ajralib turadi (p95 655 ms, busy 76,6%) — mashinadagi tashqi yuklama yoki generator bilan raqobat bo‘lishi mumkin, lekin isbotlanmagan. Uni olib tashlamadik.
+
+### Har vazifadan keyingi dinamika (xuddi shu ssenariy, Mac)
+
+| Bosqich | Room busy | Switch p95 |
+| --- | --- | --- |
+| Baseline (o‘zgarishlardan oldin) | 52,5% | 68 ms; birinchi unmute p95 288 ms |
+| + datagram marshrut keshi | 46,7% | — |
+| + trek → subscriber indeksi | 46,3–47,6% | — |
+| + audio tanlovchi (loudest-3) | ~48% (unmute probe bilan 54–55%, avval 58,6%) | 76–87 ms |
+| + keyframe birlashtirish (yakuniy kod, Task 6) | 49,8–53,2% | 102 / 330 / 335 ms (p50 ~66–77) |
+| Bugungi yakuniy run’lar (yuqorida) | 58–60% (bitta 76,6%) | 111–342 ms (bitta 655 ms) |
+
+Bugungi busy Task 6 dagidan ~7–9 punkt baland: kod o‘zgarmagan, demak bu mashina yuklamasi/ketma-ket run’lar farqi (sababi o‘rganilmadi). Baseline bilan solishtirish uchun Task 1 dan beri har run bir xil mashinada, lekin kunning boshqa vaqtida olingan — shuning uchun mutlaq son emas, tartib muhim.
+
+**Switch p95 savdosi:** baseline ~70 ms dan ~330 ms gacha o‘sdi. Sabab — keyframe so‘rovlarini birlashtirish: bitta kameraga bir necha tinglovchi bir oynada o‘tsa, keyingilarining PLI’si oyna oxirigacha kechiktiriladi (shoshilinch 250 ms, oddiy 500 ms). Evaz — bitta publisher’ga keyframe yog‘ilishi yo‘q (spec bo‘yicha asosiy maqsad) va kichikroq bandwidth/CPU. Spec ~150 ms shoshilinch oyna deb yozgan; **250 ms tanlandi**: xavfsizlik ko‘rigi bitta qatlamga ≤4 shoshilinch so‘rov/s (keyframe kuchaytirishi cheklangan) talab qildi 250 ms o‘lchov bo‘yicha tanlandi: 150 ms oyna + “500 ms da bir marta” cheklovi bilan bitta run’da p95 564 ms chiqdi (maqsaddan yuqori). 250 ms bilan p95 ≤500 ms maqsadiga yakuniy kod run’larida (Task 6: 3 ta, bugun: 5 tadan 4 tasi) tushdi.
+
+### 25 kishilik mavjud ssenariylar (`--participants 25 --seconds 20`)
+
+| Konfiguratsiya | Audio (**) | Video o‘rt./min (avval) | Qabul / qatnashchi | Room busy |
+| --- | --- | --- | --- | --- |
+| 25 × 4 video | 96,0% (min 66,7%) | 100,1% / 100% (95,5% / 90%) | ~6,2 Mbit/s | 28,4% |
+| 25 × 6 video | 96,0% (min 66,7%) | 100,1% / 100% (99,7% / 99%) | ~9,2 Mbit/s | 32,6% |
+| 25 × 8 video | 96,0% (min 66,7%) | 100,1% / 100% (71–77% / 47–66%) | ~12,0 Mbit/s | 42,0% |
+
+(**) Bu **regressiya emas, hisoblash artefakti**: 25 ta teng baland gapiruvchida server faqat 3 ta audio uzatadi (`max_forwarded_audio`), loadtest esa “kutilgan” = 3 deb sanaydi; tanlangan 3 gapiruvchining o‘zi o‘z audiosini olmaydi (2/3 = 66,7%), (22·100 + 3·66,7)/25 = 96,0% aynan mos keladi. Demak 25 kishilik xonada eshitiladigan audio endi dizayn bo‘yicha 3 ta (avval 24 ta); bu spec’ning maqsadi. Video esa aniq yaxshilandi (25 × 8: ~25% yo‘qotish → 0%), busy avvalgi ~110–125% CPU dan 42% ga tushdi (busy = xona tasking band vaqti, server jami CPU emas; sendto thread’i alohida). Eslatma: “avval” raqamlari 2026-11-18 dagi jadvaldan.
+
+### Stress: 100 kishi, 10 gapiruvchi (audio cheklovi)
+
+`--publishers 10` (qolgani xuddi shunday): audio avg 99,0% (min 66,7%) — 10 gapiruvchidan faqat 3 tasi uzatiladi, har tinglovchi 3 ta oqim oladi (o‘sha 3 gapiruvchi o‘zi 2 ta), (97·100+3·66,7)/100 = 99,0%. Video 100,0% / min 99,7%, switch p50 111 ms / p95 354 ms, room busy 74,3% (2 gapiruvchiga nisbatan ~15 punkt ko‘p: 8 qo‘shimcha gapiruvchining video qatlamlari kirishi). Cheklov ishlaydi: 10 ta kirish audio’dan faqat 3 tasi chiqadi.
+
+### Muvaffaqiyat mezonlari bilan solishtirish
+
+Hal qiluvchi sharoit (Linux 16 yadro, LAN) hali o‘lchanmagan, shuning uchun Mac natijasi “⏳” bilan belgilandi, agar u o‘tsa ham.
+
+| Mezon | Mac loopback natijasi | Holat |
+| --- | --- | --- |
+| Audio ≥ 99% | 100% (barcha run’lar) | ✅ Mac / ⏳ Linux |
+| Video o‘rt. ≥ 98%, min ≥ 95% | o‘rt. 99,9–100%, min 97,7–99,9% | ✅ Mac / ⏳ Linux |
+| Xona aktori CPU ≤ 70% (bitta yadro) | 58,3–60,4% (4 run), **76,6% (1 run)** | ⏳ (Mac: 5 dan 4 tasi o‘tdi; bitta run 70% dan oshdi — ochiq yoziladi) |
+| Switch p95 ≤ 500 ms | 111–342 ms (4 run), **655 ms (1 run)** | ⏳ (Mac: 5 dan 4 tasi o‘tdi; run 1 maqsaddan oshdi) |
+| Yangi gapiruvchi — birinchi audio paket kesilmaydi | `only_loudest_three_audio_tracks_are_forwarded`, `leaving_speaker_frees_audio_slot`, `loud_speaker_is_announced` testlari o‘tadi (trek muzokara qilingan, renegotiation yo‘q) | ✅ (testlar; haqiqiy qurilmada tinglab ko‘rilmagan ⏳) |
+| Birinchi unmute (faqat yoziladi) | p50 190 ms, p95 356 ms (Mac, loopback; haqiqiy qurilmada renegotiation sekinroq bo‘lishi mumkin) | ✅ yozildi |
+| 25 kishida regressiya yo‘q | video yaxshilandi, busy past; audio 3 ga cheklangan (dizayn) | ✅ (audio artefakti yuqorida tushuntirilgan) |
+
+**Bajarilmagan/shubhali mezonlar:** (1) Linux’dagi hal qiluvchi o‘lchov yo‘q; (2) Mac’da run-to-run chayqalish katta (busy 49–77%, switch p95 100–655 ms), shuning uchun CPU va switch mezonlarini “✅” deb bo‘lmaydi; (3) switch p95 baseline’dan ~5 baravar o‘sdi (yuqoridagi savdo). Agar Linux’da CPU ≤70% bajarilmasa, spec bo‘yicha loyiha natijani hujjatlab tugaydi va keyingi qadam sifatida 6-qism (subscriber egress’ni bir necha thread’ga taqsimlash) yoki video slotlar alohida dizaynda taklif etiladi; bu reja doirasida amalga oshirilmaydi.
+
+### Hali bajarilmagan
+
+Bu qadamlar bu mashinadan (Linux server va haqiqiy qurilmalarga ulanish yo‘q) bajarib bo‘lmadi. Foydalanuvchi bajarishi kerak; raqamlar o‘ylab topilmagan.
+
+1. **16 yadroli Linux server, generator boshqa mashinada (LAN, simli yoki router):**
+   ```bash
+   # Linux serverda
+   cd server && cargo build --release --bins && ulimit -n 65536
+   ./target/release/ecochain-rtc-server serve --config config/development.toml &
+   curl -X POST http://<SERVER_IP>:7880/v1/rooms -H 'Authorization: Bearer dev-only-admin-key' \
+     -H 'content-type: application/json' -d '{"room_id":"loadtest","max_participants":100}'
+   # Generator mashinasida (--bind-ip — generatorning LAN IP’si)
+   ./target/release/loadtest --config config/development.toml --url ws://<SERVER_IP>:7880/v1/rtc \
+     --bind-ip <GENERATOR_LAN_IP> --participants 100 --publishers 2 --cameras 10 --muted-mics 30 \
+     --max-video 4 --high-video 1 --switch-every-secs 5 --seconds 30 \
+     --metrics-url http://<SERVER_IP>:7880/metrics
+   # 3 marta; keyin --unmute-probe bilan 1 marta; so‘ng 25 kishilik ssenariylar:
+   ./target/release/loadtest --config config/development.toml --url ws://<SERVER_IP>:7880/v1/rtc \
+     --bind-ip <GENERATOR_LAN_IP> --participants 25 --max-video 4 --seconds 20   # 6 va 8 uchun ham
+   ```
+   Natijani mezonlar jadvaliga kiriting (⏳ → ✅/❌). Generator 100 botda ancha CPU oladi — alohida mashinada ham yadrolar yetarliligini tekshiring.
+2. **Qo‘lda Meet testi (2 haqiqiy qurilma + 50 bot):** `loadtest --participants 50 --publishers 2 --max-video 4` ni xonada ishga tushiring, 2 qurilmada Meet ilovasi bilan o‘sha xonaga kiring. Tekshiriladi: gapiruvchi almashganda ovoz uzilmasligi (birinchi bo‘g‘in kesilmasligi), boshqa videoga o‘tish tezligi (qora ekran bir necha soniya turmasligi), birinchi marta mikrofon yoqishdagi kechikish. Natija shu yerga yoziladi.
 
 ## Platformalar
 

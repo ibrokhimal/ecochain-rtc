@@ -51,12 +51,20 @@ Kamera 3 qatlamda yuboriladi (`q` ¼, `h` ½, `f` to‘liq; 150/500/1500 kbit/s)
 ### Paket yo‘qolishi
 
 * NACK/RTX — str0m publisher tomonda yo‘qolgan paketlarni so‘raydi, subscriber tomonda qayta yuboradi.
-* Keyframe so‘rovi (PLI) — kadr uzilib qolsa, yangi video obunada, qatlam almashganda; publisher trek’iga 500 ms’da bir martadan ko‘p emas.
+* Keyframe so‘rovi (PLI) — kadr uzilib qolsa, yangi video obunada, qatlam almashganda; har (trek, rid) uchun alohida: so‘rovlar birlashtiriladi (bir nechta subscriber bitta PLI beradi), oddiy so‘rov 500 ms’da, shoshilinch (yangi obuna, qatlam almashishi) 250 ms’da bir martadan ko‘p emas; oyna ichidagi so‘rov oyna tugaganda yuboriladi. Spec ~150 ms deb yozgan edi; 250 ms o‘lchov va xavfsizlik ko‘rigi bo‘yicha tanlandi (bitta qatlamga ≤4 shoshilinch so‘rov/s — keyframe kuchaytirish chegaralangan). Noto‘g‘ri `rid` qatlam ro‘yxatida bo‘lmasa e’tiborga olinmaydi.
 * Opus in-band FEC — libwebrtc standarti.
 
 ### Qurilmada qabul qilinadigan video soni
 
 `max_participants` (xonaga kirish, standart 25) va `max_video_subscriptions` (bitta qurilma bir vaqtda qabul qiladigan video, server limiti 9) alohida. SDK standarti: mobil 4, desktop 9. `RtcVideoSubscriptionPolicy`: ekran ulashish → mahkamlangan → faol gapiruvchilar → ko‘rinib turgan tile’lar.
+
+100 kishilik xona uchun `max_participants_limit` 150 (standart `default_max_participants` 25 o‘zgarmagan; katta xona admin API orqali `max_participants` bilan yaratiladi). Standart siyosatda faqat faol gapiruvchi/mahkamlangan tile `high` so‘raydi, qolganlari `low`: shu sharoitda 100 kishi × 4 video o‘lchandi (`TESTING.md`). Hammasini `high` so‘rash alohida stress ssenariy.
+
+### Audio tanlovchi (loudest-N)
+
+Xonada bir vaqtda faqat eng baland `rooms.max_forwarded_audio` (standart 3, 1..=8) mikrofon audiosi subscriber’larga uzatiladi; qolganlari jim bo‘lganda trek muzokara qilingan holda qoladi (renegotiation kerak emas). Daraja Opus audio-level kengaytmasidan olinadi va silliqlanadi; tanlov 500 ms ushlab turiladi (gapiruvchi shu vaqt davomida ro‘yxatda qoladi) va yangi gapiruvchi hozirgi eng sust tanlanganidan kamida 6 dB baland bo‘lsa kiradi. `speakers.changed` hodisasi kamida 250 ms oralig‘ida yuboriladi. Muted trek hech kimga yetmaydi. Birinchi marta mikrofonni yoqish renegotiation talab qiladi (~0,3–1 s, qabul qilingan qaror); o‘lchangan p95 `TESTING.md`da.
+
+Forwarding tezligi uchun: datagram marshrut keshi (UDP manzil → peer) va trek → subscriber indeksi, shuning uchun har paket uchun xonadagi hamma peer ko‘rib chiqilmaydi.
 
 ## Flutter SDK hayot sikli
 
@@ -82,7 +90,7 @@ Rejalashtirilgan dizayn: server SFU’dan trek’larni yozadi (RTP → WebM/Opus
 
 ## Kengaytirish
 
-25 kishilik bitta xona hozir bitta yadro bilan chegaralangan (natijalar `TESTING.md`da). Bir server ichida: subscriber egress’ni (SRTP shifrlash + paketlash) bir nechta thread’ga taqsimlash. Serverlararo kaskad (xonani bir necha SFU’ga bo‘lish) o‘lchovlar shuni talab qilgandagina; hozirgi raqamlar bitta xona uchun bunga hali zarurat ko‘rsatmaydi, ko‘p xonalar esa allaqachon turli yadrolarda ishlaydi.
+Bitta xona bitta yadro bilan chegaralangan. 100 kishilik ssenariy (2 gapiruvchi, 10 kamera, 4 video obuna) Mac loopback’da xona taskining ~50–60% vaqtini band qiladi (`TESTING.md`; 16 yadroli Linux’da hal qiluvchi o‘lchov hali bajarilmagan). Bir server ichida: subscriber egress’ni (SRTP shifrlash + paketlash) bir nechta thread’ga taqsimlash. Serverlararo kaskad (xonani bir necha SFU’ga bo‘lish) o‘lchovlar shuni talab qilgandagina; hozirgi raqamlar bitta xona uchun bunga hali zarurat ko‘rsatmaydi, ko‘p xonalar esa allaqachon turli yadrolarda ishlaydi.
 
 ## TURN (coturn)
 
@@ -92,5 +100,6 @@ O‘rnatish:
 
 1. Alohida xostga coturn o‘rnating va `server/deploy/coturn/turnserver.conf.example` ni `/etc/turnserver.conf` ga nusxalab, `<...>` o‘rinlarini to‘ldiring (`static-auth-secret` — `openssl rand -base64 32`). `allowed-peer-ip` faqat SFU IP’sini qoldiradi, xususiy diapazonlar `denied-peer-ip` bilan yopiladi.
 2. SFU konfiguratsiyasida `[media.turn]` ni yoqing (`config/production.example.toml`): `urls` (`turn:`/`turns:`), `secret_env` (production’da inline secret taqiqlangan, coturn bilan bir xil qiymat), `ttl_secs` (standart 3600, eng kami 60).
-3. Xavfsizlik devori: TCP/UDP 3478, TCP 443 (TURN) ochiq; coturn → SFU UDP `media.udp_port`.
-4. Secret va hosil bo‘lgan credential hech qachon loglanmaydi.
+3. Xavfsizlik devori: TCP/UDP 3478, TCP 443 (TURN) ochiq, shuningdek coturn relay porti diapazoni (`min-port`–`max-port`, misolda UDP 49152–65535); coturn → SFU UDP `media.udp_port`. `<SFU_PUBLIC_IP>` (`allowed-peer-ip`) SFU’ning `advertise_ip` qiymati bo‘lishi kerak, TURN va SFU bitta tarmoqda bo‘lsa — SFU’ning xususiy IP’si.
+4. Suiiste’molga qarshi: `user-quota` va `total-quota` (misolda 12 / 1200), IPv6 `denied-peer-ip` diapazonlari fayldagi izohlar bilan.
+5. Secret va hosil bo‘lgan credential hech qachon loglanmaydi.

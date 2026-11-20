@@ -127,7 +127,7 @@ JWT, `alg: HS256`. Tokenni Ecochain backend’i (masalan, Messenger) chiqaradi; 
 | `participant.updated` | `participant` (trek, mute, `connected` o‘zgardi) |
 | `participant.left` | `participant_id`, `reason` (`left`, `timeout`, `removed`) |
 | `subscriber.offer` | `sdp`, `revision`, `tracks[]: {mid, track_id, participant_id, source}` |
-| `speakers.changed` | `speakers[]: {participant_id, level}` (eng balanddan, ≤3) |
+| `speakers.changed` | `speakers[]: {participant_id, level}` (eng balanddan, `rooms.max_forwarded_audio` tagacha, standart 3). Hodisa kamida 250 ms oralig‘ida yuboriladi; gapiruvchi jim bo‘lgach ham 500 ms (ushlab turish) ro‘yxatda qoladi |
 | `peer.failed` | `target` — server tomonda peer o‘ldi; klient uni qayta quradi |
 | `room.ended` | `reason` (`ended_by_host`, `ended_by_admin`) |
 | `removed` | `reason` |
