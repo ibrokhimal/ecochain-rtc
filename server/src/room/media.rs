@@ -184,6 +184,7 @@ impl Room {
     /// so it can rebuild that peer (`publisher.offer` with `reset` or
     /// `subscriber.reset`).
     fn fail_peer(&mut self, index: usize, kind: PeerKind) {
+        self.forwarding_dirty = true;
         self.services
             .metrics
             .peer_failures_total
@@ -356,6 +357,7 @@ impl Room {
     /// Removes published tracks of `index` that are not in `keep` (all of
     /// them when `keep` is `None`) and stops forwarding them.
     fn unpublish(&mut self, index: usize, keep: Option<&HashSet<String>>) {
+        self.forwarding_dirty = true;
         let participant = &mut self.participants[index];
         let before = participant.tracks.len();
         participant
@@ -432,6 +434,7 @@ impl Room {
     }
 
     pub(super) fn create_subscriber(&mut self, index: usize) {
+        self.forwarding_dirty = true;
         let peer = Peer::new(
             PeerKind::Subscriber,
             &self.services.sockets,
@@ -443,6 +446,7 @@ impl Room {
     }
 
     pub(super) fn reset_subscriber(&mut self, index: usize) {
+        self.forwarding_dirty = true;
         let participant_id = self.participants[index].id.clone();
         self.forget_routes(&participant_id, Some(PeerKind::Subscriber));
         if let Some(mut old) = self.participants[index].subscriber.take() {
@@ -486,6 +490,7 @@ impl Room {
             .refresh_ufrag(&self.services.sockets, &self.packets_tx);
         sub.peer.wake(Instant::now());
 
+        self.forwarding_dirty = true;
         let mut opened = Vec::new();
         for out in &mut sub.out {
             if let OutState::Negotiating(mid) = out.state {
@@ -635,6 +640,7 @@ impl Room {
     /// at that point every entry is `ToOpen`, `Open` or `ToStop`. Quality
     /// changes apply immediately.
     fn reconcile(&mut self, index: usize) {
+        self.forwarding_dirty = true;
         let desired = self.desired_tracks(index);
         let participant = &mut self.participants[index];
         let wanted: HashSet<&str> = desired.iter().map(|d| d.track_id.as_str()).collect();
@@ -722,6 +728,7 @@ impl Room {
         if *ice_restart {
             change.ice_restart(true);
         }
+        self.forwarding_dirty = true;
         for track in out.iter_mut() {
             match track.state {
                 OutState::ToOpen => {
@@ -807,16 +814,27 @@ impl Room {
             self.request_keyframe(&publisher_id, &track_id, data.rid, KeyframeRequestKind::Pli);
         }
 
+        if self.forwarding_dirty {
+            self.rebuild_forwarding();
+        }
         let now = Instant::now();
         let mut written = 0u64;
-        let mut wanted_keyframe = Vec::new();
-        for (other_index, other) in self.participants.iter_mut().enumerate() {
-            if other_index == index {
+        let mut wanted_keyframe: Vec<Option<Rid>> = Vec::new();
+        let subscribers = self.forwarding.get(&track_id).map(Vec::as_slice);
+        for subscriber_id in subscribers.unwrap_or_default() {
+            let Some(&slot) = self.slots.get(subscriber_id) else {
+                continue;
+            };
+            let Some(other) = self.participants.get_mut(slot) else {
+                continue;
+            };
+            if slot == index || other.id != *subscriber_id {
                 continue;
             }
             let Some(sub) = other.subscriber.as_mut() else {
                 continue;
             };
+            // The index is only a hint; never write to a mid that is not open.
             let Some((out, mid)) = sub.out.iter_mut().find_map(|o| match o.state {
                 OutState::Open(mid) if o.track_id == track_id => Some((o, mid)),
                 _ => None,
@@ -830,7 +848,9 @@ impl Room {
                     continue;
                 }
                 if !data.is_keyframe() {
-                    wanted_keyframe.push(out.target_rid);
+                    if !wanted_keyframe.contains(&out.target_rid) {
+                        wanted_keyframe.push(out.target_rid);
+                    }
                     continue;
                 }
                 switched = out.current_rid.is_some();
@@ -864,6 +884,27 @@ impl Room {
         for rid in wanted_keyframe {
             self.request_keyframe(&publisher_id, &track_id, rid, KeyframeRequestKind::Pli);
         }
+    }
+
+    /// Rebuilds `forwarding` from the `Open` entries of every subscriber.
+    pub(super) fn rebuild_forwarding(&mut self) {
+        self.forwarding.clear();
+        self.slots.clear();
+        for (slot, participant) in self.participants.iter().enumerate() {
+            self.slots.insert(participant.id.clone(), slot);
+            let Some(sub) = participant.subscriber.as_ref() else {
+                continue;
+            };
+            for out in &sub.out {
+                if matches!(out.state, OutState::Open(_)) {
+                    self.forwarding
+                        .entry(out.track_id.clone())
+                        .or_default()
+                        .push(participant.id.clone());
+                }
+            }
+        }
+        self.forwarding_dirty = false;
     }
 
     fn request_keyframe(
@@ -959,6 +1000,7 @@ impl Room {
 
     /// Tears down both peers of a participant and unpublishes its tracks.
     pub(super) fn close_media(&mut self, index: usize) {
+        self.forwarding_dirty = true;
         let participant_id = self.participants[index].id.clone();
         self.forget_routes(&participant_id, None);
         let sockets = self.services.sockets.clone();

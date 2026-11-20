@@ -168,3 +168,44 @@ async fn media_keeps_flowing_after_another_participant_leaves() {
     a.leave().await;
     c.leave().await;
 }
+
+#[tokio::test]
+async fn subscriber_gets_track_only_after_answer_and_stops_after_unsubscribe() {
+    let server = common::start("").await;
+    let alice = Bot::start(server.bot("fwd-index", "alice")).await.unwrap();
+    let mut options = server.bot("fwd-index", "bob");
+    options.audio = false;
+    options.video_kbps = None;
+    let bob = Bot::start(options).await.unwrap();
+    let alice_id = alice.stats().participant_id.unwrap();
+
+    let got_video = |s: &ecochain_rtc_server::bot::BotStats| {
+        s.video_frames_by_participant
+            .get(&alice_id)
+            .is_some_and(|n| *n > 10)
+    };
+    assert!(
+        bob.wait_for(Duration::from_secs(10), got_video).await,
+        "bob: {:?}",
+        bob.stats()
+    );
+    let track_id = bob
+        .stats()
+        .remote_tracks
+        .iter()
+        .find(|(p, _, kind)| *p == alice_id && kind == "video")
+        .map(|(_, track, _)| track.clone())
+        .expect("alice video track");
+
+    bob.unsubscribe_video(track_id);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let frozen = bob.stats().video_frames_by_participant[&alice_id];
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        bob.stats().video_frames_by_participant[&alice_id],
+        frozen,
+        "frames still arriving after unsubscribe"
+    );
+    alice.leave().await;
+    bob.leave().await;
+}

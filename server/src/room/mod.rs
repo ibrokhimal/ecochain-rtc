@@ -151,6 +151,9 @@ pub fn spawn(
         packets_tx,
         participants: Vec::new(),
         routes: HashMap::new(),
+        forwarding: HashMap::new(),
+        slots: HashMap::new(),
+        forwarding_dirty: false,
         empty_since: Some(Instant::now()),
         empty_ttl_override: from_api.then_some(UNUSED_ROOM_TTL),
         speakers: Vec::new(),
@@ -170,6 +173,14 @@ pub(crate) struct Room {
     /// Source address -> owning peer, learned from datagrams. Only a hint:
     /// every hit is verified with `Peer::accepts`.
     routes: HashMap<SocketAddr, (String, PeerKind)>,
+    /// Track id -> ids of participants whose subscriber has it `Open`.
+    /// Rebuilt lazily (see `forwarding_dirty`); `forward` re-verifies entries.
+    forwarding: HashMap<String, Vec<String>>,
+    /// Participant id -> position in `participants`, valid with `forwarding`;
+    /// lookups re-check the id.
+    slots: HashMap<String, usize>,
+    /// Set wherever an `OutTrack` or subscriber peer changes.
+    forwarding_dirty: bool,
     empty_since: Option<Instant>,
     empty_ttl_override: Option<Duration>,
     speakers: Vec<String>,
@@ -400,6 +411,7 @@ impl Room {
                 let participant =
                     Participant::new(random_id("PA_"), claims, random_id("SE_"), conn.clone());
                 self.participants.push(participant);
+                self.forwarding_dirty = true;
                 self.empty_since = None;
                 self.empty_ttl_override = None;
                 self.services
@@ -689,6 +701,7 @@ impl Room {
     fn remove_participant(&mut self, index: usize, reason: Option<&str>) {
         self.close_media(index);
         let participant = self.participants.remove(index);
+        self.forwarding_dirty = true;
         self.forget_routes(&participant.id, None);
         self.services
             .metrics
