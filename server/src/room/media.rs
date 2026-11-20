@@ -334,6 +334,12 @@ impl Room {
             {
                 track.muted = offered.muted;
                 track.layers = layers;
+                // Gates of layers that are gone would only keep deferred
+                // requests for a rid the publisher no longer sends.
+                let known = &track.layers;
+                track
+                    .keyframes
+                    .retain(|rid, _| super::keyframe::is_known_layer(known, *rid));
                 kept.insert(track.id.clone());
                 if track.muted {
                     // replaceTrack(null) sends nothing more that could
