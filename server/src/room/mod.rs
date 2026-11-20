@@ -182,12 +182,18 @@ impl Room {
         addresses.mark_unchanged();
         while !self.ended {
             let deadline = self.next_timeout();
+            // Set by the arm that woke the loop: time before that is waiting.
+            let woke;
             tokio::select! {
                 command = commands.recv() => match command {
-                    Some(command) => self.handle_command(command),
+                    Some(command) => {
+                        woke = Instant::now();
+                        self.handle_command(command)
+                    }
                     None => break,
                 },
                 Some(datagram) = packets.recv() => {
+                    woke = Instant::now();
                     self.handle_datagram(datagram);
                     // Drain what is already queued before polling peers, so a
                     // burst of packets is handled in one pass.
@@ -195,11 +201,21 @@ impl Room {
                         self.handle_datagram(datagram);
                     }
                 }
-                _ = tokio::time::sleep_until(deadline.into()) => {}
-                _ = tick.tick() => self.housekeeping(),
-                Ok(()) = addresses.changed() => self.media_addresses_changed(),
+                _ = tokio::time::sleep_until(deadline.into()) => woke = Instant::now(),
+                _ = tick.tick() => {
+                    woke = Instant::now();
+                    self.housekeeping()
+                }
+                Ok(()) = addresses.changed() => {
+                    woke = Instant::now();
+                    self.media_addresses_changed()
+                }
             }
             self.drive();
+            self.services
+                .metrics
+                .room_busy_micros_total
+                .fetch_add(woke.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
 
         // Deregister first so new joins create a fresh room instead of

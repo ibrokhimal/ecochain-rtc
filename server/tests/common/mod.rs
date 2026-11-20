@@ -45,7 +45,19 @@ impl TestServer {
             video_kbps: Some(300),
             simulcast: false,
             max_video: 4,
+            audio_level: -25,
+            audio_muted: false,
+            high_video: usize::MAX,
         }
+    }
+
+    /// Like [`Self::metric`] for values that are not whole numbers; -1.0 when absent.
+    pub fn metric_f64(&self, name: &str) -> f64 {
+        let text = self.server.app.metrics.render();
+        text.lines()
+            .find_map(|l| l.strip_prefix(&format!("{name} ")))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(-1.0)
     }
 
     pub fn metric(&self, name: &str) -> i64 {

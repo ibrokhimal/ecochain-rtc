@@ -76,3 +76,49 @@ async fn audio_only_participant_without_camera() {
     alice.leave().await;
     bob.leave().await;
 }
+
+#[tokio::test]
+async fn bot_counts_frames_per_participant() {
+    let server = common::start("").await;
+    let alice = Bot::start(server.bot("per-participant", "alice"))
+        .await
+        .unwrap();
+    let mut options = server.bot("per-participant", "bob");
+    options.audio = false;
+    options.video_kbps = None;
+    let bob = Bot::start(options).await.unwrap();
+    let alice_id = alice.stats().participant_id.unwrap();
+
+    let counted = |s: &ecochain_rtc_server::bot::BotStats| {
+        s.audio_frames_by_participant
+            .get(&alice_id)
+            .is_some_and(|n| *n > 50)
+            && s.video_frames_by_participant
+                .get(&alice_id)
+                .is_some_and(|n| *n > 25)
+    };
+    assert!(
+        bob.wait_for(Duration::from_secs(10), counted).await,
+        "bob: {:?}",
+        bob.stats()
+    );
+    assert!(bob
+        .stats()
+        .remote_tracks
+        .iter()
+        .any(|(p, _, kind)| *p == alice_id && kind == "video"));
+    alice.leave().await;
+    bob.leave().await;
+}
+
+#[tokio::test]
+async fn room_busy_metric_grows() {
+    let server = common::start("").await;
+    let alice = Bot::start(server.bot("busy", "alice")).await.unwrap();
+    let bob = Bot::start(server.bot("busy", "bob")).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let busy = server.metric_f64("ecochain_rtc_room_busy_seconds_total");
+    assert!(busy > 0.0, "busy seconds {busy}");
+    alice.leave().await;
+    bob.leave().await;
+}
