@@ -92,7 +92,7 @@ impl AudioSelector {
                 };
                 let alpha = 1.0 - (-dt.as_secs_f32() / tau.as_secs_f32()).exp();
                 track.level += (sample - track.level) * alpha;
-                track.last_seen = now;
+                track.last_seen = track.last_seen.max(now);
             })
             .or_insert(Track {
                 level: sample,
@@ -102,7 +102,7 @@ impl AudioSelector {
             });
         let active = track.level >= SPEAKING_LEVEL;
         if active {
-            track.last_active = now;
+            track.last_active = track.last_active.max(now);
         }
         let selected = track.selected;
         let last_active = track.last_active;
@@ -119,6 +119,11 @@ impl AudioSelector {
             self.tracks.remove(track_id);
             return false;
         }
+
+        // Selected tracks that stopped sending (DTX, loss, replaced track)
+        // must not hold a slot or be compared at their frozen level.
+        self.tracks
+            .retain(|_, t| !t.selected || now.saturating_duration_since(t.last_seen) <= HOLD);
 
         let taken = self.tracks.values().filter(|t| t.selected).count();
         if taken < self.max {
@@ -267,6 +272,16 @@ mod tests {
         }
         assert!(decisions[&600], "still held 400 ms after silence starts");
         assert!(!decisions[&1200], "released 1000 ms after silence starts");
+    }
+
+    #[test]
+    fn stalled_tracks_release_slots() {
+        let t0 = Instant::now();
+        let mut sel = AudioSelector::new(3);
+        feed(&mut sel, t0, 0, 200, &[("a", -25), ("b", -25), ("c", -25)]);
+        // a, b, c stop sending entirely.
+        assert!(sel.observe("d", Some(-25), false, t0 + Duration::from_millis(900)));
+        assert_eq!(sel.selected(), ["d"]);
     }
 
     #[test]
