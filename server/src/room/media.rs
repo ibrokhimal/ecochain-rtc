@@ -1079,7 +1079,12 @@ impl Room {
             let out = &mut sub.out[i];
             if out.target_rid != target {
                 out.target_rid = target;
-                changed.push((out.publisher_id.clone(), out.track_id.clone(), target));
+                // An out that is not open yet gets its urgent request when
+                // the answer opens it; asking now would burn the throttle
+                // window before the m-line can receive the keyframe.
+                if matches!(out.state, OutState::Open(_)) {
+                    changed.push((out.publisher_id.clone(), out.track_id.clone(), target));
+                }
             }
         }
         // Let the estimator probe up to what the receiver asked for.

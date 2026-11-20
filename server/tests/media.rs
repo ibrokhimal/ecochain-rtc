@@ -448,12 +448,15 @@ async fn switching_to_another_video_shows_frame_quickly() {
         bob.stats()
     );
     eprintln!("switch to first frame: {:?}", start.elapsed());
-    // One subscription asks for at most one keyframe per layer; a deferred
-    // request must not fire again after the keyframe arrived.
+    // The bot counts keyframe requests per publisher, not per layer, so
+    // "at most one per layer" cannot be asserted directly. One subscription
+    // asks for one layer (one request, plus at most one from a layer change
+    // while the subscriber settles), so the total must stay <= 2; a deferred
+    // request that fires after the keyframe arrived would add one more.
     tokio::time::sleep(Duration::from_millis(1500)).await;
     let requests = carol.stats().keyframe_requests - requests_before;
     assert!(
-        requests <= 3,
+        requests <= 2,
         "{requests} keyframe requests for one subscription"
     );
     eprintln!("keyframe requests for one subscription: {requests}");

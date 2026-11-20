@@ -109,7 +109,8 @@ mod tests {
         assert!(gate.request(t0, true));
         assert!(!gate.request(t0 + ms(100), true));
         assert_eq!(gate.due(), Some(t0 + ms(250)));
-        assert!(gate.request(t0 + ms(260), true) || gate.take_due(t0 + ms(260)));
+        assert!(gate.request(t0 + ms(260), true));
+        assert_eq!(gate.due(), None);
     }
 
     #[test]
