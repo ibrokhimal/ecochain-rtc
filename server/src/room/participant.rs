@@ -1,5 +1,6 @@
 //! Per-participant state owned by the room task.
 
+use super::keyframe::KeyframeGate;
 use crate::{
     auth::{Claims, Role},
     protocol::{
@@ -54,8 +55,8 @@ pub struct PublishedTrack {
     pub muted: bool,
     /// Simulcast rids, lowest quality first. Empty without simulcast.
     pub layers: Vec<Rid>,
-    /// Last keyframe request sent to the publisher, for throttling.
-    pub last_keyframe_request: Option<Instant>,
+    /// Keyframe request throttling per layer (`None` = no simulcast).
+    pub keyframes: HashMap<Option<Rid>, KeyframeGate>,
     /// Last camera rotation the publisher signalled (RTP
     /// `urn:3gpp:video-orientation`). Phones send unrotated frames plus this
     /// value; it is copied onto every forwarded frame so that receivers,

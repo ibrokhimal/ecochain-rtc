@@ -7,6 +7,7 @@
 //! a leave racing a reconnect are resolved deterministically without locks.
 
 mod audio;
+mod keyframe;
 mod media;
 mod participant;
 

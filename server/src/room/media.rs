@@ -45,10 +45,6 @@ use str0m::{
 /// meantime go into the next offer, after the answer arrives.
 const OFFER_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Minimum spacing of keyframe requests to one publisher track. Keyframes
-/// are large; asking too often hurts everybody's bandwidth.
-const KEYFRAME_THROTTLE: Duration = Duration::from_millis(500);
-
 /// Minimum spacing of `speakers.changed` events. A change inside this
 /// window is sent when it ends.
 const SPEAKERS_THROTTLE: Duration = Duration::from_millis(250);
@@ -62,6 +58,9 @@ impl Room {
     pub(super) fn next_timeout(&self) -> Instant {
         let mut next = Instant::now() + super::TICK;
         if let Some(due) = self.speakers_due {
+            next = next.min(due);
+        }
+        if let Some(due) = self.keyframes_due() {
             next = next.min(due);
         }
         for participant in &self.participants {
@@ -127,6 +126,7 @@ impl Room {
     /// Advances all peers, then announces a speaker change if the audio
     /// selection changed or a throttled change is due.
     pub(super) fn drive(&mut self) {
+        self.flush_keyframes(Instant::now());
         self.drive_peers();
         let now = Instant::now();
         if self.audio.generation() != self.audio_generation
@@ -241,7 +241,7 @@ impl Room {
                     out.publisher_id.clone(),
                     out.current_rid.or(out.target_rid),
                 );
-                self.request_keyframe(&publisher_id, &track_id, rid, request.kind);
+                self.request_keyframe(&publisher_id, &track_id, rid, request.kind, false);
             }
             (
                 PeerKind::Subscriber,
@@ -352,7 +352,7 @@ impl Room {
                     source: offered.source,
                     muted: offered.muted,
                     layers,
-                    last_keyframe_request: None,
+                    keyframes: HashMap::new(),
                     orientation: None,
                 };
                 kept.insert(track.id.clone());
@@ -534,7 +534,13 @@ impl Room {
             .retain(|o| !matches!(o.state, OutState::NegotiatingStop(_)));
         // A new video receiver can only start decoding at a keyframe.
         for (publisher_id, track_id, rid) in opened {
-            self.request_keyframe(&publisher_id, &track_id, rid, KeyframeRequestKind::Pli);
+            self.request_keyframe(
+                &publisher_id,
+                &track_id,
+                rid,
+                KeyframeRequestKind::Pli,
+                true,
+            );
         }
         Ok(())
     }
@@ -840,7 +846,13 @@ impl Room {
         } else if !data.contiguous {
             // Packets were lost beyond what NACK recovered; the decoder
             // needs a fresh keyframe.
-            self.request_keyframe(&publisher_id, &track_id, data.rid, KeyframeRequestKind::Pli);
+            self.request_keyframe(
+                &publisher_id,
+                &track_id,
+                data.rid,
+                KeyframeRequestKind::Pli,
+                false,
+            );
         }
 
         if self.forwarding_dirty {
@@ -910,7 +922,13 @@ impl Room {
             .media_out_total
             .fetch_add(written, Ordering::Relaxed);
         for rid in wanted_keyframe {
-            self.request_keyframe(&publisher_id, &track_id, rid, KeyframeRequestKind::Pli);
+            self.request_keyframe(
+                &publisher_id,
+                &track_id,
+                rid,
+                KeyframeRequestKind::Pli,
+                false,
+            );
         }
     }
 
@@ -935,12 +953,16 @@ impl Room {
         self.forwarding_dirty = false;
     }
 
+    /// Asks the publisher for a keyframe of one layer. Requests inside the
+    /// layer's throttle window are deferred and sent by `flush_keyframes`.
+    /// `urgent` (new subscription, layer switch) uses a shorter window.
     fn request_keyframe(
         &mut self,
         publisher_id: &str,
         track_id: &str,
         rid: Option<Rid>,
         kind: KeyframeRequestKind,
+        urgent: bool,
     ) {
         let Some(index) = self.index_of(publisher_id) else {
             return;
@@ -950,22 +972,55 @@ impl Room {
             return;
         };
         let now = Instant::now();
-        if track
-            .last_keyframe_request
-            .is_some_and(|at| now - at < KEYFRAME_THROTTLE)
-        {
+        if !track.keyframes.entry(rid).or_default().request(now, urgent) {
             return;
         }
+        let mid = track.mid;
+        Self::send_keyframe_request(participant, mid, rid, kind, now);
+    }
+
+    fn send_keyframe_request(
+        participant: &mut super::participant::Participant,
+        mid: Mid,
+        rid: Option<Rid>,
+        kind: KeyframeRequestKind,
+        now: Instant,
+    ) {
         let Some(peer) = participant.publisher.as_mut() else {
             return;
         };
-        let Some(mut writer) = peer.rtc.writer(track.mid) else {
+        let Some(mut writer) = peer.rtc.writer(mid) else {
             return;
         };
         if writer.is_request_keyframe_possible(kind) && writer.request_keyframe(rid, kind).is_ok() {
-            track.last_keyframe_request = Some(now);
             peer.wake(now);
         }
+    }
+
+    /// Sends the keyframe requests whose deferral has ended.
+    pub(super) fn flush_keyframes(&mut self, now: Instant) {
+        for participant in &mut self.participants {
+            let mut due = Vec::new();
+            for track in &mut participant.tracks {
+                for (rid, gate) in &mut track.keyframes {
+                    if gate.take_due(now) {
+                        due.push((track.mid, *rid));
+                    }
+                }
+            }
+            for (mid, rid) in due {
+                Self::send_keyframe_request(participant, mid, rid, KeyframeRequestKind::Pli, now);
+            }
+        }
+    }
+
+    fn keyframes_due(&self) -> Option<Instant> {
+        self.participants
+            .iter()
+            .flat_map(|p| &p.tracks)
+            .flat_map(|t| t.keyframes.values())
+            .filter_map(|g| g.due())
+            .min()
     }
 
     /// Picks the simulcast layer per forwarded video track from requested
@@ -1022,7 +1077,13 @@ impl Room {
             sub.peer.wake(Instant::now());
         }
         for (publisher_id, track_id, rid) in changed {
-            self.request_keyframe(&publisher_id, &track_id, rid, KeyframeRequestKind::Pli);
+            self.request_keyframe(
+                &publisher_id,
+                &track_id,
+                rid,
+                KeyframeRequestKind::Pli,
+                true,
+            );
         }
     }
 

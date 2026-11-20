@@ -386,3 +386,115 @@ async fn loud_speaker_is_announced() {
     speaker.leave().await;
     listener.leave().await;
 }
+
+fn first_frame_from(stats: &BotStats, participant_id: &str) -> bool {
+    stats
+        .video_frames_by_participant
+        .get(participant_id)
+        .is_some_and(|n| *n > 0)
+}
+
+#[tokio::test]
+async fn switching_to_another_video_shows_frame_quickly() {
+    let server = common::start("").await;
+    let room = "switch-video";
+    let mut options = server.bot(room, "alice");
+    options.simulcast = true;
+    let alice = Bot::start(options).await.unwrap();
+    let mut options = server.bot(room, "bob");
+    options.video_kbps = None;
+    options.audio = false;
+    options.max_video = 1;
+    let bob = Bot::start(options).await.unwrap();
+    let alice_id = alice.stats().participant_id.unwrap();
+    assert!(
+        bob.wait_for(Duration::from_secs(10), |s| first_frame_from(s, &alice_id))
+            .await,
+        "bob: {:?}",
+        bob.stats()
+    );
+
+    let mut options = server.bot(room, "carol");
+    options.simulcast = true;
+    let carol = Bot::start(options).await.unwrap();
+    let carol_id = carol.stats().participant_id.unwrap();
+    assert!(
+        bob.wait_for(Duration::from_secs(10), |s| s
+            .remote_tracks
+            .iter()
+            .any(|(p, _, kind)| *p == carol_id && kind == "video"))
+            .await,
+        "bob: {:?}",
+        bob.stats()
+    );
+    let track_id = bob
+        .stats()
+        .remote_tracks
+        .iter()
+        .find(|(p, _, kind)| *p == carol_id && kind == "video")
+        .map(|(_, track, _)| track.clone())
+        .unwrap();
+    // Let the throttle windows of carol's track expire, so only the fast path
+    // for new subscriptions is measured.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    let start = Instant::now();
+    bob.subscribe_video(track_id, "high");
+    assert!(
+        bob.wait_for(Duration::from_secs(1), |s| first_frame_from(s, &carol_id))
+            .await,
+        "no frame from carol within 1 s: {:?}",
+        bob.stats()
+    );
+    eprintln!("switch to first frame: {:?}", start.elapsed());
+    alice.leave().await;
+    bob.leave().await;
+    carol.leave().await;
+}
+
+#[tokio::test]
+async fn burst_of_subscribers_gets_video_with_few_keyframes() {
+    const LISTENERS: usize = 20;
+    let server = common::start("").await;
+    let room = "burst";
+    let mut options = server.bot(room, "alice");
+    options.simulcast = true;
+    let alice = Bot::start(options).await.unwrap();
+    let alice_id = alice.stats().participant_id.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let before = alice.stats().keyframe_requests;
+    let start = Instant::now();
+    let mut starts = Vec::new();
+    for i in 0..LISTENERS {
+        let options = listener(&server, room, &format!("l{i}"));
+        starts.push(tokio::spawn(
+            async move { Bot::start(options).await.unwrap() },
+        ));
+    }
+    let mut bots = Vec::new();
+    for handle in starts {
+        bots.push(handle.await.unwrap());
+    }
+    for bot in &bots {
+        assert!(
+            bot.wait_for(Duration::from_secs(10), |s| first_frame_from(s, &alice_id))
+                .await,
+            "listener without video: {:?}",
+            bot.stats()
+        );
+    }
+    let window = start.elapsed();
+    let requests = alice.stats().keyframe_requests - before;
+    // At most one request per layer per urgent window (3 layers).
+    let bound = (window.as_millis() as u64 / 150 + 1) * 3;
+    assert!(
+        requests <= bound,
+        "{requests} keyframe requests in {window:?}, bound {bound}"
+    );
+    eprintln!("keyframe requests: {requests} in {window:?}, bound {bound}");
+    alice.leave().await;
+    for bot in bots {
+        bot.leave().await;
+    }
+}
