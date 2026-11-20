@@ -23,7 +23,8 @@ use crate::{
 };
 use serde_json::json;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
+    net::SocketAddr,
     sync::atomic::Ordering,
     time::{Duration, Instant},
 };
@@ -89,7 +90,7 @@ impl Room {
             for kind in [PeerKind::Publisher, PeerKind::Subscriber] {
                 if self.deliver(index, kind, &datagram) {
                     let id = self.participants[index].id.clone();
-                    self.routes.insert(datagram.source, (id, kind));
+                    insert_route(&mut self.routes, datagram.source, id, kind);
                     return;
                 }
             }
@@ -1066,4 +1067,68 @@ fn validate_tracks(tracks: &[OfferedTrack]) -> Result<(), ProtocolError> {
         }
     }
     Ok(())
+}
+
+/// Most source addresses cached per peer. A client may legitimately use a few
+/// (network switch, several candidate pairs); more would only let it grow the
+/// cache.
+const MAX_ROUTES_PER_PEER: usize = 4;
+
+/// Caches `source` for a peer, evicting another address of the same peer when
+/// it already has `MAX_ROUTES_PER_PEER`.
+fn insert_route(
+    routes: &mut HashMap<SocketAddr, (String, PeerKind)>,
+    source: SocketAddr,
+    participant_id: String,
+    kind: PeerKind,
+) {
+    let mut own = routes
+        .iter()
+        .filter(|(addr, (id, k))| **addr != source && *id == participant_id && *k == kind)
+        .map(|(addr, _)| *addr);
+    let count = own.clone().count();
+    if count >= MAX_ROUTES_PER_PEER {
+        if let Some(victim) = own.next() {
+            routes.remove(&victim);
+        }
+    }
+    routes.insert(source, (participant_id, kind));
+}
+
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+
+    #[test]
+    fn routes_per_peer_are_capped() {
+        let mut routes = HashMap::new();
+        for port in 1000..1100u16 {
+            let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+            insert_route(&mut routes, addr, "a".into(), PeerKind::Publisher);
+        }
+        let other: SocketAddr = ([127, 0, 0, 2], 1).into();
+        insert_route(&mut routes, other, "b".into(), PeerKind::Publisher);
+        let sub: SocketAddr = ([127, 0, 0, 3], 1).into();
+        insert_route(&mut routes, sub, "a".into(), PeerKind::Subscriber);
+        let count = |routes: &HashMap<SocketAddr, (String, PeerKind)>, id: &str, kind| {
+            routes
+                .values()
+                .filter(|(i, k)| i == id && *k == kind)
+                .count()
+        };
+        assert_eq!(
+            count(&routes, "a", PeerKind::Publisher),
+            MAX_ROUTES_PER_PEER
+        );
+        assert_eq!(count(&routes, "b", PeerKind::Publisher), 1);
+        assert_eq!(count(&routes, "a", PeerKind::Subscriber), 1);
+        // The newest address is always kept; re-inserting a known one is free.
+        let newest: SocketAddr = ([127, 0, 0, 1], 1099).into();
+        assert!(routes.contains_key(&newest));
+        insert_route(&mut routes, newest, "a".into(), PeerKind::Publisher);
+        assert_eq!(
+            count(&routes, "a", PeerKind::Publisher),
+            MAX_ROUTES_PER_PEER
+        );
+    }
 }
