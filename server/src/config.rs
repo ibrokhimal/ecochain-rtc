@@ -124,6 +124,10 @@ pub struct RoomsConfig {
     /// receive at the same time. This is separate from `max_participants`:
     /// a 25 person room does not mean a phone decodes 24 videos.
     pub max_video_subscriptions: usize,
+    /// How many audio tracks are forwarded at the same time: only the
+    /// loudest this many speakers are heard, so a 100 person room does not
+    /// send every receiver 99 audio streams. 1..=8.
+    pub max_forwarded_audio: usize,
     /// How long a participant whose signaling socket dropped keeps its seat
     /// and media while waiting for a resume.
     pub reconnect_grace_secs: u64,
@@ -143,8 +147,9 @@ impl Default for RoomsConfig {
         Self {
             auto_create: false,
             default_max_participants: 25,
-            max_participants_limit: 100,
+            max_participants_limit: 150,
             max_video_subscriptions: 9,
+            max_forwarded_audio: 3,
             reconnect_grace_secs: 30,
             empty_room_ttl_secs: 60,
             ended_room_memory_secs: 24 * 3600,
@@ -318,6 +323,10 @@ pub fn parse(
         rooms.max_video_subscriptions >= 1,
         "rooms.max_video_subscriptions must be at least 1"
     );
+    anyhow::ensure!(
+        (1..=8).contains(&rooms.max_forwarded_audio),
+        "rooms.max_forwarded_audio must be between 1 and 8"
+    );
 
     let mut listen = file.media.listen;
     if listen.is_empty() {
@@ -431,6 +440,30 @@ listen = [{ bind_ip = "127.0.0.1" }]
         let config = parse(DEV, Path::new("."), &no_env).unwrap();
         assert_eq!(config.mode, Mode::Development);
         assert_eq!(config.rooms.default_max_participants, 25);
+        assert_eq!(config.rooms.max_participants_limit, 150);
+    }
+
+    #[test]
+    fn max_forwarded_audio_defaults_to_three() {
+        let config = parse(DEV, Path::new("."), &no_env).unwrap();
+        assert_eq!(config.rooms.max_forwarded_audio, 3);
+        let text = DEV.replace("[media]", "[rooms]\nmax_forwarded_audio = 8\n[media]");
+        let config = parse(&text, Path::new("."), &no_env).unwrap();
+        assert_eq!(config.rooms.max_forwarded_audio, 8);
+    }
+
+    #[test]
+    fn max_forwarded_audio_out_of_range_is_rejected() {
+        for value in [0, 9] {
+            let text = DEV.replace(
+                "[media]",
+                &format!("[rooms]\nmax_forwarded_audio = {value}\n[media]"),
+            );
+            let error = parse(&text, Path::new("."), &no_env)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("max_forwarded_audio"), "{value}: {error}");
+        }
     }
 
     #[test]

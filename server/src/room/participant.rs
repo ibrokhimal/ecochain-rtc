@@ -265,10 +265,6 @@ pub struct Participant {
     pub muted_audio: HashSet<String>,
     /// Duplicate request detection.
     pub responses: ResponseCache,
-    /// Sum of linear audio levels in the current speaker window.
-    pub level_sum: f32,
-    /// Number of samples in `level_sum`.
-    pub level_count: u32,
 }
 
 impl Participant {
@@ -290,8 +286,6 @@ impl Participant {
             video_subscriptions: HashMap::new(),
             muted_audio: HashSet::new(),
             responses: ResponseCache::default(),
-            level_sum: 0.0,
-            level_count: 0,
         }
     }
 

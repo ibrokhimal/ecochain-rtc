@@ -7,7 +7,6 @@
 //! sees sequence number gaps, only a keyframe from the new layer.
 
 use super::{
-    audio::SPEAKING_LEVEL,
     participant::{OutState, OutTrack, PendingOffer, PublishedTrack, Subscriber},
     random_id, Room,
 };
@@ -50,8 +49,9 @@ const OFFER_TIMEOUT: Duration = Duration::from_secs(10);
 /// are large; asking too often hurts everybody's bandwidth.
 const KEYFRAME_THROTTLE: Duration = Duration::from_millis(500);
 
-/// Window for active speaker detection.
-const SPEAKER_WINDOW: Duration = Duration::from_millis(500);
+/// Minimum spacing of `speakers.changed` events. A change inside this
+/// window is sent when it ends.
+const SPEAKERS_THROTTLE: Duration = Duration::from_millis(250);
 
 /// Upper bound of drive iterations per wakeup, to keep one room from
 /// starving others if events keep producing events.
@@ -61,6 +61,9 @@ impl Room {
     /// Earliest timer of any peer, but never later than the next tick.
     pub(super) fn next_timeout(&self) -> Instant {
         let mut next = Instant::now() + super::TICK;
+        if let Some(due) = self.speakers_due {
+            next = next.min(due);
+        }
         for participant in &self.participants {
             if let Some(peer) = &participant.publisher {
                 next = next.min(peer.next_timeout());
@@ -121,9 +124,21 @@ impl Room {
             .retain(|_, (id, k)| !(id == participant_id && kind.is_none_or(|kind| kind == *k)));
     }
 
+    /// Advances all peers, then announces a speaker change if the audio
+    /// selection changed or a throttled change is due.
+    pub(super) fn drive(&mut self) {
+        self.drive_peers();
+        let now = Instant::now();
+        if self.audio.generation() != self.audio_generation
+            || self.speakers_due.is_some_and(|due| due <= now)
+        {
+            self.update_speakers(now);
+        }
+    }
+
     /// Advances all peers, sends their datagrams and processes their events
     /// until nothing new happens.
-    pub(super) fn drive(&mut self) {
+    fn drive_peers(&mut self) {
         for _ in 0..MAX_DRIVE_ROUNDS {
             let now = Instant::now();
             let mut produced = Vec::new();
@@ -320,6 +335,11 @@ impl Room {
                 track.muted = offered.muted;
                 track.layers = layers;
                 kept.insert(track.id.clone());
+                if track.muted {
+                    // replaceTrack(null) sends nothing more that could
+                    // release the slot.
+                    self.audio.remove(&track.id);
+                }
             } else {
                 let track = PublishedTrack {
                     id: random_id("TR_"),
@@ -356,10 +376,15 @@ impl Room {
     fn unpublish(&mut self, index: usize, keep: Option<&HashSet<String>>) {
         self.forwarding_dirty = true;
         let participant = &mut self.participants[index];
+        let audio = &mut self.audio;
         let before = participant.tracks.len();
-        participant
-            .tracks
-            .retain(|t| keep.is_some_and(|keep| keep.contains(&t.id)));
+        participant.tracks.retain(|t| {
+            let kept = keep.is_some_and(|keep| keep.contains(&t.id));
+            if !kept {
+                audio.remove(&t.id);
+            }
+            kept
+        });
         if participant.tracks.len() == before {
             return;
         }
@@ -393,6 +418,9 @@ impl Room {
             .ok_or_else(|| {
                 ProtocolError::new(ErrorCode::InvalidState, "source is not published")
             })?;
+        if muted {
+            self.audio.remove(&track.id);
+        }
         if track.muted != muted {
             track.muted = muted;
             let info = participant.info();
@@ -793,18 +821,21 @@ impl Room {
         if data.ext_vals.video_orientation.is_some() {
             track.orientation = data.ext_vals.video_orientation;
         }
-        let (track_id, kind, orientation) = (track.id.clone(), track.kind, track.orientation);
+        let (track_id, kind, orientation, muted) =
+            (track.id.clone(), track.kind, track.orientation, track.muted);
         let publisher_id = publisher.id.clone();
+        let now = Instant::now();
 
         let mut audio_level = None;
         if kind == MediaKind::Audio {
-            if let Some(level) = data.ext_vals.audio_level {
-                // RFC 6464: level is -dBov, 0 is loudest, -127 silence.
-                let linear = 10f32.powf(f32::from(level.min(0)) / 20.0);
-                publisher.level_sum += linear;
-                publisher.level_count += 1;
-                audio_level = Some((level, data.ext_vals.voice_activity.unwrap_or(false)));
+            // RFC 6464: level is -dBov, 0 is loudest, -127 silence.
+            let level = data.ext_vals.audio_level;
+            // Only the loudest few tracks reach subscribers; the m-lines of
+            // the others stay negotiated and simply carry no packets.
+            if !self.audio.observe(&track_id, level, muted, now) {
+                return;
             }
+            audio_level = level.map(|l| (l, data.ext_vals.voice_activity.unwrap_or(false)));
         } else if !data.contiguous {
             // Packets were lost beyond what NACK recovered; the decoder
             // needs a fresh keyframe.
@@ -814,7 +845,6 @@ impl Room {
         if self.forwarding_dirty {
             self.rebuild_forwarding();
         }
-        let now = Instant::now();
         let mut written = 0u64;
         let mut wanted_keyframe: Vec<Option<Rid>> = Vec::new();
         let subscribers = self.forwarding.get(&track_id).map(Vec::as_slice);
@@ -1035,37 +1065,57 @@ impl Room {
             self.allocate_layers(index);
         }
 
-        if now - self.last_speaker_check >= SPEAKER_WINDOW {
-            self.last_speaker_check = now;
-            self.update_speakers();
-        }
+        // Expires stalled speakers and picks up order changes.
+        self.update_speakers(now);
     }
 
-    fn update_speakers(&mut self) {
-        let mut levels: Vec<(String, f32)> = Vec::new();
-        for participant in &mut self.participants {
-            if participant.level_count > 0 {
-                let average = participant.level_sum / participant.level_count as f32;
-                if average >= SPEAKING_LEVEL {
-                    levels.push((participant.id.clone(), average));
-                }
-            }
-            participant.level_sum = 0.0;
-            participant.level_count = 0;
-        }
-        levels.sort_by(|a, b| b.1.total_cmp(&a.1));
-        levels.truncate(3);
-        let ids: Vec<String> = levels.iter().map(|(id, _)| id.clone()).collect();
-        if ids != self.speakers {
-            self.speakers = ids;
-            let speakers: Vec<_> = levels
+    /// Current speakers by participant, loudest first, with the smoothed
+    /// linear level. Stalled tracks are expired first.
+    pub(super) fn current_speakers(&mut self, now: Instant) -> Vec<(String, f32)> {
+        self.audio.expire(now);
+        let mut speakers: Vec<(String, f32)> = Vec::new();
+        for (track_id, level) in self.audio.selected_levels() {
+            let Some(publisher) = self
+                .participants
                 .iter()
-                .map(|(id, level)| json!({"participant_id": id, "level": (level * 100.0).round() / 100.0}))
-                .collect();
-            let event = Outbound::event("speakers.changed", json!({"speakers": speakers}));
-            for participant in &self.participants {
-                participant.send(event.clone());
+                .find(|p| p.tracks.iter().any(|t| t.id == track_id))
+            else {
+                continue;
+            };
+            // Loudest first: a second track of the same participant is quieter.
+            if !speakers.iter().any(|(id, _)| *id == publisher.id) {
+                speakers.push((publisher.id.clone(), level));
             }
+        }
+        speakers
+    }
+
+    /// Sends `speakers.changed` when the speaker list changed, at most once
+    /// per `SPEAKERS_THROTTLE`; a held back change is sent via `speakers_due`.
+    fn update_speakers(&mut self, now: Instant) {
+        let levels = self.current_speakers(now);
+        self.audio_generation = self.audio.generation();
+        let ids: Vec<String> = levels.iter().map(|(id, _)| id.clone()).collect();
+        if ids == self.speakers {
+            self.speakers_due = None;
+            return;
+        }
+        if let Some(last) = self.last_speakers_sent {
+            if now.saturating_duration_since(last) < SPEAKERS_THROTTLE {
+                self.speakers_due = Some(last + SPEAKERS_THROTTLE);
+                return;
+            }
+        }
+        self.speakers = ids;
+        self.last_speakers_sent = Some(now);
+        self.speakers_due = None;
+        let speakers: Vec<_> = levels
+            .iter()
+            .map(|(id, level)| json!({"participant_id": id, "level": (level * 100.0).round() / 100.0}))
+            .collect();
+        let event = Outbound::event("speakers.changed", json!({"speakers": speakers}));
+        for participant in &self.participants {
+            participant.send(event.clone());
         }
     }
 }

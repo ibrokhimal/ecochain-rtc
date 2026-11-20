@@ -51,6 +51,8 @@ fn to_db(linear: f32) -> f32 {
 pub struct AudioSelector {
     max: usize,
     tracks: HashMap<String, Track>,
+    /// Bumped whenever the set of selected tracks changes.
+    generation: u64,
 }
 
 impl AudioSelector {
@@ -58,6 +60,7 @@ impl AudioSelector {
         Self {
             max,
             tracks: HashMap::new(),
+            generation: 0,
         }
     }
 
@@ -72,7 +75,7 @@ impl AudioSelector {
         now: Instant,
     ) -> bool {
         if muted {
-            self.tracks.remove(track_id);
+            self.remove(track_id);
             return false;
         }
         let Some(dbov) = level_dbov else {
@@ -112,7 +115,7 @@ impl AudioSelector {
             if active || now.saturating_duration_since(last_active) <= HOLD {
                 return true;
             }
-            self.tracks.remove(track_id);
+            self.remove(track_id);
             return false;
         }
         if !active {
@@ -120,10 +123,7 @@ impl AudioSelector {
             return false;
         }
 
-        // Selected tracks that stopped sending (DTX, loss, replaced track)
-        // must not hold a slot or be compared at their frozen level.
-        self.tracks
-            .retain(|_, t| !t.selected || now.saturating_duration_since(t.last_seen) <= HOLD);
+        self.expire(now);
 
         let taken = self.tracks.values().filter(|t| t.selected).count();
         if taken < self.max {
@@ -138,7 +138,7 @@ impl AudioSelector {
             .map(|(id, t)| (id.clone(), t.db()));
         match quietest {
             Some((id, quiet_db)) if db >= quiet_db + SWAP_MARGIN_DB => {
-                self.tracks.remove(&id);
+                self.remove(&id);
                 self.select(track_id);
                 true
             }
@@ -149,23 +149,58 @@ impl AudioSelector {
     fn select(&mut self, track_id: &str) {
         if let Some(track) = self.tracks.get_mut(track_id) {
             track.selected = true;
+            self.generation += 1;
         }
     }
 
+    /// Forgets a track (muted, unpublished, publisher left), freeing its slot.
     pub fn remove(&mut self, track_id: &str) {
-        self.tracks.remove(track_id);
+        if self.tracks.remove(track_id).is_some_and(|t| t.selected) {
+            self.generation += 1;
+        }
+    }
+
+    /// Changes whenever the set of selected tracks changes, so callers can
+    /// skip recomputing derived state when it did not.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Forgets tracks that sent nothing for longer than the hold time.
+    /// Selected tracks that stopped sending (DTX, loss, replaced track) must
+    /// not hold a slot, be compared at their frozen level or be reported as
+    /// speakers; a stalled unselected track starts afresh when it returns.
+    pub fn expire(&mut self, now: Instant) {
+        let mut dropped_selected = false;
+        self.tracks.retain(|_, t| {
+            let keep = now.saturating_duration_since(t.last_seen) <= HOLD;
+            dropped_selected |= !keep && t.selected;
+            keep
+        });
+        if dropped_selected {
+            self.generation += 1;
+        }
     }
 
     /// Selected tracks, loudest first.
+    #[cfg(test)]
     pub fn selected(&self) -> Vec<String> {
-        let mut selected: Vec<(&String, f32)> = self
+        self.selected_levels()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    /// Selected tracks with their smoothed linear level (0..1), loudest first.
+    pub fn selected_levels(&self) -> Vec<(String, f32)> {
+        let mut selected: Vec<(String, f32)> = self
             .tracks
             .iter()
             .filter(|(_, t)| t.selected)
-            .map(|(id, t)| (id, t.level))
+            .map(|(id, t)| (id.clone(), t.level))
             .collect();
         selected.sort_by(|a, b| b.1.total_cmp(&a.1));
-        selected.into_iter().map(|(id, _)| id.clone()).collect()
+        selected
     }
 }
 
@@ -291,6 +326,53 @@ mod tests {
         feed(&mut sel, t0, 0, 200, &[("a", -25), ("b", -25), ("c", -25)]);
         sel.remove("a");
         assert!(sel.observe("d", Some(-30), false, t0 + Duration::from_millis(220)));
+    }
+
+    #[test]
+    fn expire_drops_stalled_selected_tracks() {
+        let t0 = Instant::now();
+        let mut sel = AudioSelector::new(3);
+        feed(&mut sel, t0, 0, 200, &[("a", -25), ("b", -25)]);
+        feed(&mut sel, t0, 200, 600, &[("b", -25)]);
+        // a stopped at 180 ms; b is still sending at 780 ms.
+        sel.expire(t0 + Duration::from_millis(700));
+        assert_eq!(sel.selected(), ["b"]);
+    }
+
+    #[test]
+    fn expire_keeps_tracks_within_hold() {
+        let t0 = Instant::now();
+        let mut sel = AudioSelector::new(3);
+        feed(&mut sel, t0, 0, 200, &[("a", -25)]);
+        sel.expire(t0 + Duration::from_millis(600));
+        assert_eq!(sel.selected(), ["a"]);
+    }
+
+    #[test]
+    fn selected_levels_are_smoothed_linear_loudest_first() {
+        let t0 = Instant::now();
+        let mut sel = AudioSelector::new(3);
+        feed(&mut sel, t0, 0, 400, &[("a", -20), ("b", -6)]);
+        let levels = sel.selected_levels();
+        assert_eq!(levels.len(), 2);
+        assert_eq!(levels[0].0, "b");
+        assert!((levels[0].1 - 0.501).abs() < 0.01, "{levels:?}");
+        assert!((levels[1].1 - 0.1).abs() < 0.01, "{levels:?}");
+    }
+
+    #[test]
+    fn generation_changes_only_with_the_selected_set() {
+        let t0 = Instant::now();
+        let mut sel = AudioSelector::new(3);
+        let g0 = sel.generation();
+        feed(&mut sel, t0, 0, 200, &[("a", -25)]);
+        let g1 = sel.generation();
+        assert_ne!(g0, g1);
+        feed(&mut sel, t0, 200, 200, &[("a", -25)]);
+        sel.remove("never-seen");
+        assert_eq!(sel.generation(), g1);
+        sel.remove("a");
+        assert_ne!(sel.generation(), g1);
     }
 
     #[test]

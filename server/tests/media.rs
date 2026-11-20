@@ -2,7 +2,7 @@
 
 mod common;
 
-use ecochain_rtc_server::bot::Bot;
+use ecochain_rtc_server::bot::{Bot, BotOptions, BotStats};
 use std::time::{Duration, Instant};
 
 #[tokio::test]
@@ -208,4 +208,178 @@ async fn subscriber_gets_track_only_after_answer_and_stops_after_unsubscribe() {
     );
     alice.leave().await;
     bob.leave().await;
+}
+
+/// An audio-only bot that speaks at `level` dBov and receives everything.
+fn speaker(server: &common::TestServer, room: &str, identity: &str, level: i8) -> BotOptions {
+    let mut options = server.bot(room, identity);
+    options.video_kbps = None;
+    options.audio_level = level;
+    options
+}
+
+/// A bot that publishes nothing.
+fn listener(server: &common::TestServer, room: &str, identity: &str) -> BotOptions {
+    let mut options = server.bot(room, identity);
+    options.audio = false;
+    options.video_kbps = None;
+    options
+}
+
+fn frames_from(stats: &BotStats, participant_id: &str) -> u64 {
+    stats
+        .audio_frames_by_participant
+        .get(participant_id)
+        .copied()
+        .unwrap_or(0)
+}
+
+#[tokio::test]
+async fn only_loudest_three_audio_tracks_are_forwarded() {
+    let server = common::start("").await;
+    let room = "loudest";
+    let mut speakers = Vec::new();
+    for (name, level) in [("a", -10), ("b", -15), ("c", -20), ("quiet", -45)] {
+        speakers.push(
+            Bot::start(speaker(&server, room, name, level))
+                .await
+                .unwrap(),
+        );
+    }
+    let ids: Vec<String> = speakers
+        .iter()
+        .map(|b| b.stats().participant_id.unwrap())
+        .collect();
+    let listener = Bot::start(listener(&server, room, "listener"))
+        .await
+        .unwrap();
+
+    let loud = ids[..3].to_vec();
+    assert!(
+        listener
+            .wait_for(Duration::from_secs(10), |s| loud
+                .iter()
+                .all(|id| frames_from(s, id) > 100))
+            .await,
+        "listener: {:?}",
+        listener.stats()
+    );
+    let before = frames_from(&listener.stats(), &ids[3]);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let after = frames_from(&listener.stats(), &ids[3]);
+    assert!(
+        after - before < 10,
+        "quiet speaker forwarded: {before} -> {after}"
+    );
+
+    for bot in speakers {
+        bot.leave().await;
+    }
+    listener.leave().await;
+}
+
+#[tokio::test]
+async fn leaving_speaker_frees_audio_slot() {
+    let server = common::start("").await;
+    let room = "slot";
+    let listener = Bot::start(listener(&server, room, "listener"))
+        .await
+        .unwrap();
+    let mut first = Vec::new();
+    for (name, level) in [("a", -10), ("b", -15), ("c", -20)] {
+        first.push(
+            Bot::start(speaker(&server, room, name, level))
+                .await
+                .unwrap(),
+        );
+    }
+    let ids: Vec<String> = first
+        .iter()
+        .map(|b| b.stats().participant_id.unwrap())
+        .collect();
+    assert!(
+        listener
+            .wait_for(Duration::from_secs(10), |s| ids
+                .iter()
+                .all(|id| frames_from(s, id) > 50))
+            .await,
+        "listener: {:?}",
+        listener.stats()
+    );
+    // Joins last and is less than the swap margin quieter: no slot.
+    let fourth = Bot::start(speaker(&server, room, "d", -25)).await.unwrap();
+    let fourth_id = fourth.stats().participant_id.unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let before = frames_from(&listener.stats(), &fourth_id);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let after = frames_from(&listener.stats(), &fourth_id);
+    assert!(
+        after - before < 10,
+        "fourth forwarded early: {before} -> {after}"
+    );
+
+    let mut first = first.into_iter();
+    first.next().unwrap().leave().await;
+    assert!(
+        listener
+            .wait_for(Duration::from_secs(2), |s| frames_from(s, &fourth_id)
+                > after + 20)
+            .await,
+        "listener: {:?}",
+        listener.stats()
+    );
+
+    for bot in first {
+        bot.leave().await;
+    }
+    fourth.leave().await;
+    listener.leave().await;
+}
+
+#[tokio::test]
+async fn muted_audio_reaches_nobody() {
+    let server = common::start("").await;
+    let room = "muted";
+    let mut options = speaker(&server, room, "speaker", -10);
+    options.audio_muted = true;
+    let speaker = Bot::start(options).await.unwrap();
+    let listener = Bot::start(listener(&server, room, "listener"))
+        .await
+        .unwrap();
+    // Wait for the listener's subscriber to be set up with the speaker's track.
+    assert!(
+        listener
+            .wait_for(Duration::from_secs(10), |s| !s.remote_tracks.is_empty())
+            .await,
+        "listener: {:?}",
+        listener.stats()
+    );
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(listener.stats().audio_frames, 0);
+    speaker.leave().await;
+    listener.leave().await;
+}
+
+#[tokio::test]
+async fn loud_speaker_is_announced() {
+    let server = common::start("").await;
+    let room = "announce";
+    let speaker = Bot::start(speaker(&server, room, "speaker", -10))
+        .await
+        .unwrap();
+    let listener = Bot::start(listener(&server, room, "listener"))
+        .await
+        .unwrap();
+    assert!(
+        listener
+            .wait_for(Duration::from_secs(5), |s| s
+                .events
+                .iter()
+                .any(|e| e == "speakers.changed"))
+            .await,
+        "listener: {:?}",
+        listener.stats()
+    );
+    speaker.leave().await;
+    listener.leave().await;
 }

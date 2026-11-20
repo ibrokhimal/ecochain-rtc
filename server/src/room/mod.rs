@@ -6,8 +6,6 @@
 //! processes every command in order, concurrent joins, duplicate requests and
 //! a leave racing a reconnect are resolved deterministically without locks.
 
-// AudioSelector is wired into Room::forward in the next task.
-#[allow(dead_code)]
 mod audio;
 mod media;
 mod participant;
@@ -25,6 +23,7 @@ use crate::{
         udp::{Datagram, MediaSockets, RoomPackets},
     },
 };
+use audio::AudioSelector;
 use participant::Participant;
 use rand::{distributions::Alphanumeric, Rng};
 use serde_json::{json, Value};
@@ -147,6 +146,7 @@ pub fn spawn(
         .metrics
         .rooms_active
         .fetch_add(1, Ordering::Relaxed);
+    let audio = AudioSelector::new(services.config.rooms.max_forwarded_audio);
     let room = Room {
         id,
         max_participants,
@@ -159,8 +159,11 @@ pub fn spawn(
         forwarding_dirty: false,
         empty_since: Some(Instant::now()),
         empty_ttl_override: from_api.then_some(UNUSED_ROOM_TTL),
+        audio,
+        audio_generation: 0,
         speakers: Vec::new(),
-        last_speaker_check: Instant::now(),
+        last_speakers_sent: None,
+        speakers_due: None,
         ended: false,
     };
     tokio::spawn(room.run(commands_rx, packets_rx, handle.clone()));
@@ -186,8 +189,16 @@ pub(crate) struct Room {
     forwarding_dirty: bool,
     empty_since: Option<Instant>,
     empty_ttl_override: Option<Duration>,
+    /// Decides which audio tracks are forwarded (the loudest N).
+    audio: AudioSelector,
+    /// `audio.generation()` when `speakers` was last computed.
+    audio_generation: u64,
+    /// Participant ids of the last `speakers.changed`, loudest first.
     speakers: Vec<String>,
-    last_speaker_check: Instant,
+    /// When the last `speakers.changed` was sent (throttle).
+    last_speakers_sent: Option<Instant>,
+    /// A speaker change held back by the throttle is sent at this time.
+    speakers_due: Option<Instant>,
     ended: bool,
 }
 
@@ -442,6 +453,11 @@ impl Room {
             );
         }
 
+        let speakers: Vec<String> = self
+            .current_speakers(Instant::now())
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
         let participant = &self.participants[index];
         let config = &self.services.config;
         let data = json!({
@@ -458,7 +474,7 @@ impl Room {
                 "max_participants": self.max_participants,
                 "max_video_subscriptions": config.rooms.max_video_subscriptions,
             },
-            "speakers": self.speakers,
+            "speakers": speakers,
             "ice_servers": config.media.ice_servers,
             "reconnect_grace_ms": config.rooms.reconnect_grace().as_millis() as u64,
             "heartbeat_interval_ms": crate::signaling::HEARTBEAT_INTERVAL.as_millis() as u64,

@@ -75,7 +75,8 @@ struct Args {
     #[arg(long)]
     unmute_probe: bool,
     /// Audio tracks each receiver is expected to get (default: the number of
-    /// publishers other than the receiver).
+    /// publishers other than the receiver, capped at the server's
+    /// `rooms.max_forwarded_audio` from `--config`).
     #[arg(long)]
     expect_audio: Option<usize>,
     /// `/metrics` URL of the server, to report how busy the room task was.
@@ -200,7 +201,10 @@ async fn main() -> anyhow::Result<()> {
     for (i, (b, a)) in before.iter().zip(&after).enumerate() {
         let own_audio = usize::from(part(i) == Part::Publisher);
         let own_video = usize::from(matches!(part(i), Part::Publisher | Part::Camera));
-        let audio_tracks = args.expect_audio.unwrap_or(publishers - own_audio);
+        // Only the loudest `max_forwarded_audio` tracks are forwarded.
+        let audio_tracks = args
+            .expect_audio
+            .unwrap_or((publishers - own_audio).min(config.rooms.max_forwarded_audio));
         let expected_audio = 50.0 * audio_tracks as f64;
         let expected_video = 25.0 * args.max_video.min(video_tracks - own_video) as f64;
         if expected_audio > 0.0 {
