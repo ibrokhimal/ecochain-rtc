@@ -29,7 +29,7 @@
 
 * **Nega:** sans-IO dizayn — kutubxona socket va thread’larni o‘zi boshqarmaydi. Bu SFU uchun qulay: bitta xonaning barcha peer’lari bitta task ichida, lock’siz. ICE, DTLS-SRTP, NACK/RTX, TWCC BWE, simulcast (RID), Opus/VP8/VP9/H264/AV1 qo‘llanadi. Litsenziya MIT OR Apache-2.0.
 * **Kriptografiya backend’i:** `aws-lc-rs` (str0m standarti). `examples` feature o‘chirilgan.
-* **Cheklovlar:** TURN server o‘zida yo‘q (coturn kabi alohida xizmat kerak, `media.ice_servers`); TCP/ICE-TCP yo‘q (faqat UDP). str0m “frame mode”da ishlatiladi: media birliklari depaketlanadi va har subscriber uchun qayta paketlanadi — bu simulcast almashishini xavfsiz qiladi, lekin passthrough’dan ko‘ra ko‘proq CPU sarflaydi.
+* **Cheklovlar:** TURN server o‘zida yo‘q (coturn kabi alohida xizmat kerak; vaqtinchalik ma’lumotlar uchun quyidagi “TURN (coturn)” bo‘limiga qarang); TCP/ICE-TCP yo‘q (faqat UDP). str0m “frame mode”da ishlatiladi: media birliklari depaketlanadi va har subscriber uchun qayta paketlanadi — bu simulcast almashishini xavfsiz qiladi, lekin passthrough’dan ko‘ra ko‘proq CPU sarflaydi.
 * **Alternativalar:** `webrtc-rs` (Pion porti) — og‘irroq, async-ga bog‘langan, SFU yozish uchun ko‘proq kod. LiveKit — Go’da, o‘z SDK’lari bilan; vazifa o‘z serverimizni talab qiladi.
 
 ### Ikki PeerConnection (publisher + subscriber)
@@ -83,3 +83,14 @@ Rejalashtirilgan dizayn: server SFU’dan trek’larni yozadi (RTP → WebM/Opus
 ## Kengaytirish
 
 25 kishilik bitta xona hozir bitta yadro bilan chegaralangan (natijalar `TESTING.md`da). Bir server ichida: subscriber egress’ni (SRTP shifrlash + paketlash) bir nechta thread’ga taqsimlash. Serverlararo kaskad (xonani bir necha SFU’ga bo‘lish) o‘lchovlar shuni talab qilgandagina; hozirgi raqamlar bitta xona uchun bunga hali zarurat ko‘rsatmaydi, ko‘p xonalar esa allaqachon turli yadrolarda ishlaydi.
+
+## TURN (coturn)
+
+SFU faqat UDP’da ishlaydi; UDP bloklangan tarmoqdagi mijozlar coturn orqali TCP/TLS 443 bo‘ylab ulanadi. Statik parol tarqatilmaydi: har bir `join` javobiga coturn `use-auth-secret` (TURN REST API) bo‘yicha vaqtinchalik ma’lumot qo‘shiladi — `username = "<muddati>:<identity>"`, `credential = base64(HMAC-SHA1(secret, username))`. Statik `media.ice_servers` o‘zgarmaydi, TURN yozuvi oxiriga qo‘shiladi.
+
+O‘rnatish:
+
+1. Alohida xostga coturn o‘rnating va `server/deploy/coturn/turnserver.conf.example` ni `/etc/turnserver.conf` ga nusxalab, `<...>` o‘rinlarini to‘ldiring (`static-auth-secret` — `openssl rand -base64 32`). `allowed-peer-ip` faqat SFU IP’sini qoldiradi, xususiy diapazonlar `denied-peer-ip` bilan yopiladi.
+2. SFU konfiguratsiyasida `[media.turn]` ni yoqing (`config/production.example.toml`): `urls` (`turn:`/`turns:`), `secret_env` (production’da inline secret taqiqlangan, coturn bilan bir xil qiymat), `ttl_secs` (standart 3600, eng kami 60).
+3. Xavfsizlik devori: TCP/UDP 3478, TCP 443 (TURN) ochiq; coturn → SFU UDP `media.udp_port`.
+4. Secret va hosil bo‘lgan credential hech qachon loglanmaydi.

@@ -180,6 +180,34 @@ struct FileMediaConfig {
     ice_servers: Vec<IceServer>,
     #[serde(default = "default_true")]
     follow_primary: bool,
+    turn: Option<FileTurnConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileTurnConfig {
+    urls: Vec<String>,
+    secret_env: Option<String>,
+    secret: Option<String>,
+    #[serde(default = "default_turn_ttl_secs")]
+    ttl_secs: u64,
+}
+
+fn default_turn_ttl_secs() -> u64 {
+    3600
+}
+
+/// Ephemeral TURN credentials (coturn `use-auth-secret`, TURN REST API).
+/// Every join gets its own time-limited username and credential derived from
+/// `secret`, so no static TURN password ships to clients.
+#[derive(Debug, Clone)]
+pub struct TurnConfig {
+    /// `turn:` / `turns:` URLs handed to clients.
+    pub urls: Vec<String>,
+    /// Shared secret; must equal coturn's `static-auth-secret`.
+    pub secret: Secret,
+    /// Credential lifetime in seconds (default 3600, minimum 60).
+    pub ttl_secs: u64,
 }
 
 fn default_true() -> bool {
@@ -227,6 +255,8 @@ pub struct MediaConfig {
     /// With an empty `listen`, move the media socket when the machine's
     /// primary address changes (new Wi-Fi). Default `true`.
     pub follow_primary: bool,
+    /// Per-join TURN credentials, when configured.
+    pub turn: Option<TurnConfig>,
 }
 
 /// Fully validated server configuration.
@@ -337,6 +367,36 @@ pub fn parse(
         "no media address could be determined; set media.listen"
     );
 
+    let turn = match file.media.turn {
+        None => None,
+        Some(t) => {
+            anyhow::ensure!(!t.urls.is_empty(), "media.turn.urls must not be empty");
+            for url in &t.urls {
+                anyhow::ensure!(
+                    url.starts_with("turn:") || url.starts_with("turns:"),
+                    "media.turn.urls entries must start with turn: or turns:"
+                );
+            }
+            anyhow::ensure!(t.ttl_secs >= 60, "media.turn.ttl_secs must be at least 60");
+            let secret = resolve_secret(
+                "media.turn.secret",
+                t.secret_env.as_deref(),
+                t.secret.as_deref(),
+                production,
+                env,
+            )?;
+            anyhow::ensure!(
+                !secret.expose().is_empty(),
+                "media.turn.secret must not be empty"
+            );
+            Some(TurnConfig {
+                urls: t.urls,
+                secret,
+                ttl_secs: t.ttl_secs,
+            })
+        }
+    };
+
     Ok(Config {
         mode: file.mode,
         http,
@@ -351,6 +411,7 @@ pub fn parse(
             listen,
             ice_servers: file.media.ice_servers,
             follow_primary: file.media.follow_primary,
+            turn,
         },
     })
 }
@@ -494,5 +555,37 @@ listen = [{ bind_ip = "127.0.0.1" }]
         let printed = format!("{config:?}");
         assert!(!printed.contains("dev-secret"));
         assert!(!printed.contains("dev-admin-key"));
+    }
+
+    #[test]
+    fn turn_config_is_validated() {
+        let with = |turn: &str| format!("{DEV}\n[media.turn]\n{turn}");
+        let ok = with("urls = [\"turns:t.example.com:443?transport=tcp\"]\nsecret = \"s\"");
+        let turn = parse(&ok, Path::new("."), &no_env).unwrap().media.turn;
+        let turn = turn.unwrap();
+        assert_eq!(turn.ttl_secs, 3600);
+        assert!(!format!("{turn:?}").contains("\"s\""));
+
+        for (bad, needle) in [
+            ("urls = [\"stun:x:3478\"]\nsecret = \"s\"", "turn:"),
+            (
+                "urls = [\"turn:x\"]\nsecret = \"s\"\nttl_secs = 59",
+                "ttl_secs",
+            ),
+            ("urls = []\nsecret = \"s\"", "urls"),
+            ("urls = [\"turn:x\"]", "media.turn.secret"),
+        ] {
+            let error = parse(&with(bad), Path::new("."), &no_env)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(needle), "{bad}: {error}");
+        }
+
+        let prod = with("urls = [\"turn:x\"]\nsecret = \"s\"")
+            .replace("\"development\"", "\"production\"");
+        let error = parse(&prod, Path::new("."), &no_env)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("inline secrets"), "{error}");
     }
 }

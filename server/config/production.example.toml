@@ -32,3 +32,11 @@ ice_servers = [
   { urls = ["stun:stun.example.com:3478"] },
   { urls = ["turns:turn.example.com:5349?transport=tcp"], username = "ecochain", credential = "from-your-turn-service" },
 ]
+
+# Ephemeral TURN credentials (coturn `use-auth-secret`): each join gets its own
+# time-limited username/credential, so no static TURN password reaches clients.
+# Secret must equal coturn's static-auth-secret (see deploy/coturn/).
+# [media.turn]
+# urls = ["turns:<DOMAIN>:443?transport=tcp", "turn:<DOMAIN>:3478?transport=udp"]
+# secret_env = "ECOCHAIN_RTC_TURN_SECRET"   # inline `secret` is rejected in production
+# ttl_secs = 3600                            # default 3600, minimum 60

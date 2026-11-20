@@ -87,14 +87,19 @@ pub fn token_with(config: &Config, room: &str, identity: &str, role: Role, ttl: 
 
 /// Starts a development-mode server. `extra` is appended to the `[rooms]` table.
 pub async fn start(rooms: &str) -> TestServer {
-    start_config(test_config(rooms)).await
+    start_config(test_config(rooms, "")).await
+}
+
+/// Like [`start`], with extra text appended to the `[media]` table.
+pub async fn start_with_media(media: &str) -> TestServer {
+    start_config(test_config("", media)).await
 }
 
 /// Like [`start`], but the media socket is treated as automatically chosen,
 /// so the test can move it with `MediaSockets::move_primary`. The background
 /// watcher is off: the test decides when the address "changes".
 pub async fn start_following_primary() -> TestServer {
-    let mut config = test_config("");
+    let mut config = test_config("", "");
     config.media.listen[0].auto = true;
     config.media.follow_primary = false;
     start_config(config).await
@@ -107,7 +112,7 @@ async fn start_config(config: Config) -> TestServer {
     TestServer { server, config }
 }
 
-fn test_config(rooms: &str) -> Config {
+fn test_config(rooms: &str, media: &str) -> Config {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "warn".into()))
         .with_test_writer()
@@ -132,6 +137,7 @@ admin_key = "{ADMIN}"
 [media]
 udp_port = 0
 listen = [{{ bind_ip = "127.0.0.1" }}]
+{media}
 "#
     );
     config::parse(&text, Path::new("."), &|_| None).expect("config")

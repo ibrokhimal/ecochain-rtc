@@ -22,6 +22,7 @@ pub mod room;
 pub mod rooms;
 pub mod sfu;
 pub mod signaling;
+pub mod turn;
 
 use config::Config;
 use metrics::Metrics;

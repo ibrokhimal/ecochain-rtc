@@ -491,3 +491,32 @@ async fn reused_request_id_after_resume_runs_the_new_request() {
         .unwrap();
     g2.wait_event("removed", WAIT).await.unwrap();
 }
+
+#[tokio::test]
+async fn join_response_contains_turn_credentials() {
+    let server = common::start_with_media(
+        r#"ice_servers = [{ urls = ["stun:stun.example.com:3478"] }]
+turn = { urls = ["turns:turn.example.com:443?transport=tcp"], secret = "turn-shared-secret", ttl_secs = 600 }"#,
+    )
+    .await;
+    let mut client = server.signal().await;
+    let joined = client
+        .request(
+            "join",
+            json!({"token": server.token("turn", "alice", Role::Participant)}),
+        )
+        .await
+        .unwrap();
+    let servers = joined["ice_servers"].as_array().unwrap();
+    assert_eq!(servers.len(), 2, "{servers:?}");
+    assert_eq!(servers[0]["urls"][0], "stun:stun.example.com:3478");
+    assert_eq!(
+        servers[1]["urls"][0],
+        "turns:turn.example.com:443?transport=tcp"
+    );
+    let username = servers[1]["username"].as_str().unwrap();
+    assert!(username.ends_with(":alice"), "{username}");
+    let expiry: u64 = username.split(':').next().unwrap().parse().unwrap();
+    assert!(expiry > ecochain_rtc_server::auth::unix_now());
+    assert!(!servers[1]["credential"].as_str().unwrap().is_empty());
+}

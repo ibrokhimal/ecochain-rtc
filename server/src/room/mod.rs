@@ -464,6 +464,14 @@ impl Room {
             .collect();
         let participant = &self.participants[index];
         let config = &self.services.config;
+        let mut ice_servers = config.media.ice_servers.clone();
+        if let Some(turn) = &config.media.turn {
+            ice_servers.push(crate::turn::credentials(
+                turn,
+                &claims.sub,
+                crate::auth::unix_now(),
+            ));
+        }
         let data = json!({
             "protocol": crate::protocol::PROTOCOL_VERSION,
             "session_id": participant.session_id,
@@ -479,7 +487,7 @@ impl Room {
                 "max_video_subscriptions": config.rooms.max_video_subscriptions,
             },
             "speakers": speakers,
-            "ice_servers": config.media.ice_servers,
+            "ice_servers": ice_servers,
             "reconnect_grace_ms": config.rooms.reconnect_grace().as_millis() as u64,
             "heartbeat_interval_ms": crate::signaling::HEARTBEAT_INTERVAL.as_millis() as u64,
         });

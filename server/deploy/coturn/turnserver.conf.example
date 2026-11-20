@@ -1,0 +1,54 @@
+# coturn example for ecochain-rtc. The SFU is UDP-only; clients on networks
+# that block UDP use this relay over TCP/TLS 443. Replace every <PLACEHOLDER>.
+# Credentials are ephemeral (TURN REST API): the SFU derives them per join
+# from the same secret, so no static user/password is configured here.
+
+# Plain TURN (UDP/TCP) listener.
+listening-port=3478
+# TURN over TLS; 443 passes most firewalls. Needs root or CAP_NET_BIND_SERVICE.
+tls-listening-port=443
+
+# Public address of this TURN host (the interface clients reach).
+listening-ip=<TURN_PUBLIC_IP>
+relay-ip=<TURN_PUBLIC_IP>
+# Needed when the host sits behind 1:1 NAT (cloud VM): <public>/<private>.
+# external-ip=<TURN_PUBLIC_IP>/<TURN_PRIVATE_IP>
+
+# Authentication realm; any stable name, usually your domain.
+realm=<DOMAIN>
+
+# Ephemeral credentials: username "<expiry>:<identity>", password is
+# base64(HMAC-SHA1(secret, username)).
+use-auth-secret
+# Must equal the secret of [media.turn] in the SFU config
+# (keep it out of git; generate with: openssl rand -base64 32).
+static-auth-secret=<STATIC_AUTH_SECRET>
+
+# TLS certificate for <DOMAIN>.
+cert=/etc/letsencrypt/live/<DOMAIN>/fullchain.pem
+pkey=/etc/letsencrypt/live/<DOMAIN>/privkey.pem
+
+# Add a fingerprint to TURN messages (required by WebRTC clients).
+fingerprint
+
+# Disable the telnet admin interface.
+no-cli
+
+# --- Relay hardening: clients may only reach the SFU, never your network ---
+# Never relay to multicast addresses.
+no-multicast-peers
+# Block private/loopback/link-local ranges (SSRF into the internal network).
+denied-peer-ip=0.0.0.0-0.255.255.255
+denied-peer-ip=10.0.0.0-10.255.255.255
+denied-peer-ip=100.64.0.0-100.127.255.255
+denied-peer-ip=127.0.0.0-127.255.255.255
+denied-peer-ip=169.254.0.0-169.254.255.255
+denied-peer-ip=172.16.0.0-172.31.255.255
+denied-peer-ip=192.0.0.0-192.0.0.255
+denied-peer-ip=192.168.0.0-192.168.255.255
+denied-peer-ip=198.18.0.0-198.19.255.255
+denied-peer-ip=240.0.0.0-255.255.255.255
+# Allow only the SFU media address (advertise_ip of media.listen). If the SFU
+# is on a private address of the same network, allowed-peer-ip takes
+# precedence over denied-peer-ip, so list that exact address here.
+allowed-peer-ip=<SFU_PUBLIC_IP>
