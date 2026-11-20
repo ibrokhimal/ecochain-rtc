@@ -844,12 +844,13 @@ impl Room {
         if kind == MediaKind::Audio {
             // RFC 6464: level is -dBov, 0 is loudest, -127 silence.
             let level = data.ext_vals.audio_level;
-            // Only the loudest few tracks reach subscribers; the m-lines of
-            // the others stay negotiated and simply carry no packets.
-            if !self.audio.observe(&track_id, level, muted, now) {
+            let voice = data.ext_vals.voice_activity.unwrap_or(false);
+            // Only a few tracks reach subscribers; the m-lines of the others
+            // stay negotiated and simply carry no packets.
+            if !self.audio.observe(&track_id, level, voice, muted, now) {
                 return;
             }
-            audio_level = level.map(|l| (l, data.ext_vals.voice_activity.unwrap_or(false)));
+            audio_level = level.map(|l| (l, voice));
         } else if !data.contiguous {
             // Packets were lost beyond what NACK recovered; the decoder
             // needs a fresh keyframe.
@@ -1155,7 +1156,7 @@ impl Room {
     pub(super) fn current_speakers(&mut self, now: Instant) -> Vec<(String, f32)> {
         self.audio.expire(now);
         let mut speakers: Vec<(String, f32)> = Vec::new();
-        for (track_id, level) in self.audio.selected_levels() {
+        for (track_id, level) in self.audio.speaker_levels() {
             let Some(publisher) = self
                 .participants
                 .iter()

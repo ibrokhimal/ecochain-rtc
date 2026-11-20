@@ -387,6 +387,39 @@ async fn loud_speaker_is_announced() {
     listener.leave().await;
 }
 
+#[tokio::test]
+async fn quiet_speaker_reaches_listener_when_slots_are_free() {
+    let server = common::start("").await;
+    let room = "quiet";
+    // -40 dBov is below the speaking threshold (about -30.5) but not silence:
+    // with free slots it is forwarded, yet never announced as a speaker.
+    let speaker = Bot::start(speaker(&server, room, "soft", -40))
+        .await
+        .unwrap();
+    let speaker_id = speaker.stats().participant_id.unwrap();
+    let listener = Bot::start(listener(&server, room, "listener"))
+        .await
+        .unwrap();
+    assert!(
+        listener
+            .wait_for(Duration::from_secs(10), |s| frames_from(s, &speaker_id)
+                > 50)
+            .await,
+        "listener: {:?}",
+        listener.stats()
+    );
+    assert!(
+        !listener
+            .stats()
+            .events
+            .iter()
+            .any(|e| e == "speakers.changed"),
+        "quiet member announced as speaker"
+    );
+    speaker.leave().await;
+    listener.leave().await;
+}
+
 fn first_frame_from(stats: &BotStats, participant_id: &str) -> bool {
     stats
         .video_frames_by_participant
