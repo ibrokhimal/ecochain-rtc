@@ -165,13 +165,13 @@ Run 1 ajralib turadi (p95 655 ms, busy 76,6%) — mashinadagi tashqi yuklama yok
 | Baseline (o‘zgarishlardan oldin) | 52,5% | 68 ms; birinchi unmute p95 288 ms |
 | + datagram marshrut keshi | 46,7% | — |
 | + trek → subscriber indeksi | 46,3–47,6% | — |
-| + audio tanlovchi (loudest-3) | ~48% (unmute probe bilan 54–55%, avval 58,6%) | 76–87 ms |
+| + audio tanlovchi (loudest-3) | ~48% (`--unmute-probe` bilan 54–55%; xuddi shu probe run’i tanlovchisiz oldingi commit’da 58,6%) | 76–87 ms |
 | + keyframe birlashtirish (yakuniy kod, Task 6) | 49,8–53,2% | 102 / 330 / 335 ms (p50 ~66–77) |
 | Bugungi yakuniy run’lar (yuqorida) | 58–60% (bitta 76,6%) | 111–342 ms (bitta 655 ms) |
 
 Bugungi busy Task 6 dagidan ~7–9 punkt baland: kod o‘zgarmagan, demak bu mashina yuklamasi/ketma-ket run’lar farqi (sababi o‘rganilmadi). Baseline bilan solishtirish uchun Task 1 dan beri har run bir xil mashinada, lekin kunning boshqa vaqtida olingan — shuning uchun mutlaq son emas, tartib muhim.
 
-**Switch p95 savdosi:** baseline ~70 ms dan ~330 ms gacha o‘sdi. Sabab — keyframe so‘rovlarini birlashtirish: bitta kameraga bir necha tinglovchi bir oynada o‘tsa, keyingilarining PLI’si oyna oxirigacha kechiktiriladi (shoshilinch 250 ms, oddiy 500 ms). Evaz — bitta publisher’ga keyframe yog‘ilishi yo‘q (spec bo‘yicha asosiy maqsad) va kichikroq bandwidth/CPU. Spec ~150 ms shoshilinch oyna deb yozgan; **250 ms tanlandi**: xavfsizlik ko‘rigi bitta qatlamga ≤4 shoshilinch so‘rov/s (keyframe kuchaytirishi cheklangan) talab qildi 250 ms o‘lchov bo‘yicha tanlandi: 150 ms oyna + “500 ms da bir marta” cheklovi bilan bitta run’da p95 564 ms chiqdi (maqsaddan yuqori). 250 ms bilan p95 ≤500 ms maqsadiga yakuniy kod run’larida (Task 6: 3 ta, bugun: 5 tadan 4 tasi) tushdi.
+**Switch p95 savdosi:** baseline ~70 ms dan ~330 ms gacha o‘sdi. Sabab — keyframe so‘rovlarini birlashtirish: bitta kameraga bir necha tinglovchi bir oynada o‘tsa, keyingilarining PLI’si oyna oxirigacha kechiktiriladi (shoshilinch 250 ms, oddiy 500 ms). Evaz — bitta publisher’ga keyframe yog‘ilishi yo‘q (spec bo‘yicha asosiy maqsad) va kichikroq bandwidth/CPU. Spec ~150 ms shoshilinch oyna deb yozgan; **250 ms tanlandi**. Xavfsizlik ko‘rigi bitta qatlamga ≤4 shoshilinch so‘rov/s talab qildi (keyframe kuchaytirishini cheklash uchun). Qiymat o‘lchov bo‘yicha tanlandi: 150 ms oyna + “500 ms da bir marta” cheklovi bilan bitta run’da p95 564 ms chiqdi (maqsaddan yuqori). 250 ms bilan p95 ≤500 ms maqsadiga yakuniy kod run’larida tushdi: yuqoridagi jadvalning “keyframe birlashtirish” qatoridagi 3 run (102 / 330 / 335 ms) va bugungi 5 run’dan 4 tasi.
 
 ### 25 kishilik mavjud ssenariylar (`--participants 25 --seconds 20`)
 
@@ -206,6 +206,8 @@ Hal qiluvchi sharoit (Linux 16 yadro, LAN) hali o‘lchanmagan, shuning uchun Ma
 ### Hali bajarilmagan
 
 Bu qadamlar bu mashinadan (Linux server va haqiqiy qurilmalarga ulanish yo‘q) bajarib bo‘lmadi. Foydalanuvchi bajarishi kerak; raqamlar o‘ylab topilmagan.
+
+Faqat LAN, `development.toml` dev kalitlari bilan — internetga ochmang.
 
 1. **16 yadroli Linux server, generator boshqa mashinada (LAN, simli yoki router):**
    ```bash

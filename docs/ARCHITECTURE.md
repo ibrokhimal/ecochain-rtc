@@ -62,7 +62,14 @@ Kamera 3 qatlamda yuboriladi (`q` ¼, `h` ½, `f` to‘liq; 150/500/1500 kbit/s)
 
 ### Audio tanlovchi (loudest-N)
 
-Xonada bir vaqtda faqat eng baland `rooms.max_forwarded_audio` (standart 3, 1..=8) mikrofon audiosi subscriber’larga uzatiladi; qolganlari jim bo‘lganda trek muzokara qilingan holda qoladi (renegotiation kerak emas). Daraja Opus audio-level kengaytmasidan olinadi va silliqlanadi; tanlov 500 ms ushlab turiladi (gapiruvchi shu vaqt davomida ro‘yxatda qoladi) va yangi gapiruvchi hozirgi eng sust tanlanganidan kamida 6 dB baland bo‘lsa kiradi. `speakers.changed` hodisasi kamida 250 ms oralig‘ida yuboriladi. Muted trek hech kimga yetmaydi. Birinchi marta mikrofonni yoqish renegotiation talab qiladi (~0,3–1 s, qabul qilingan qaror); o‘lchangan p95 `TESTING.md`da.
+Xonada bir vaqtda ko‘pi bilan `rooms.max_forwarded_audio` (standart 3, 1..=8) mikrofon audiosi subscriber’larga uzatiladi; qolganlarining paketlari yuborilmaydi, trek esa muzokara qilingan holda qoladi (renegotiation kerak emas). Daraja Opus audio-level kengaytmasidan (RFC 6464) olinadi va silliqlanadi. Qoidalar:
+
+* **Bo‘sh slot** har qanday jim bo‘lmagan audioni oladi: daraja ≥ −70 dBov yoki voice activity bayrog‘i o‘rnatilgan. Shu sababli past ovozli gapiruvchi, uzoqdagi noutbuk mikrofoni yoki AGC’siz telefon (−32…−45 dBov) ham eshitiladi. Daraja kengaytmasi bo‘lmasa, paket doim uzatiladi.
+* **Gapiruvchi** — silliqlangan darajasi oxirgi 500 ms ichida ≥ −30 dBov (`SPEAKING_LEVEL` 0,03) bo‘lgan tanlangan trek. Faqat gapiruvchilar `speakers.changed` va join `speakers` ro‘yxatiga tushadi; past ovozli a’zoni qabul qilish yoki chiqarish hodisa yubormaydi.
+* **Almashtirish:** yangi gapiruvchi (≥ −30 dBov) gapiruvchi bo‘lmagan a’zoning slotini darhol (6 dB shartisiz) oladi; barcha a’zolar gapiruvchi bo‘lsa, eng sust gapiruvchidan kamida 6 dB baland bo‘lishi kerak. Past ovozli yangi kelgan to‘la xonada slot olmaydi.
+* **Bo‘shatish:** a’zo 500 ms dan ortiq faqat jimlik (< −70 dBov) yuborsa, muted bo‘lsa, paket yubormay qo‘ysa yoki almashtirilsa slot bo‘shaydi; doimiy past ovozli mikrofon slotlar bo‘sh ekan qoladi (churn yo‘q).
+
+ `speakers.changed` hodisasi kamida 250 ms oralig‘ida yuboriladi. Muted trek hech kimga yetmaydi. Birinchi marta mikrofonni yoqish renegotiation talab qiladi (~0,3–1 s, qabul qilingan qaror); o‘lchangan p95 `TESTING.md`da.
 
 Forwarding tezligi uchun: datagram marshrut keshi (UDP manzil → peer) va trek → subscriber indeksi, shuning uchun har paket uchun xonadagi hamma peer ko‘rib chiqilmaydi.
 
@@ -99,7 +106,9 @@ SFU faqat UDP’da ishlaydi; UDP bloklangan tarmoqdagi mijozlar coturn orqali TC
 O‘rnatish:
 
 1. Alohida xostga coturn o‘rnating va `server/deploy/coturn/turnserver.conf.example` ni `/etc/turnserver.conf` ga nusxalab, `<...>` o‘rinlarini to‘ldiring (`static-auth-secret` — `openssl rand -base64 32`). `allowed-peer-ip` faqat SFU IP’sini qoldiradi, xususiy diapazonlar `denied-peer-ip` bilan yopiladi.
-2. SFU konfiguratsiyasida `[media.turn]` ni yoqing (`config/production.example.toml`): `urls` (`turn:`/`turns:`), `secret_env` (production’da inline secret taqiqlangan, coturn bilan bir xil qiymat), `ttl_secs` (standart 3600, eng kami 60).
+2. SFU konfiguratsiyasida `[media.turn]` ni yoqing (`config/production.example.toml`): `urls` (`turn:`/`turns:`), `secret_env` (production’da inline secret taqiqlangan, coturn bilan bir xil qiymat), `ttl_secs` (standart 43200 = 12 soat, eng kami 60). `ttl_secs` ≥ eng uzun uchrashuv bo‘lsin: SDK `ice_servers`ni faqat (qayta) join’da o‘qiydi va credential’ni faqat rejoin’da yangilaydi, muddati o‘tgach ICE restart relay ajrata olmaydi. `secret_env` qiymatining boshi/oxiridagi bo‘shliq va yangi qator kesib tashlanadi.
 3. Xavfsizlik devori: TCP/UDP 3478, TCP 443 (TURN) ochiq, shuningdek coturn relay porti diapazoni (`min-port`–`max-port`, misolda UDP 49152–65535); coturn → SFU UDP `media.udp_port`. `<SFU_PUBLIC_IP>` (`allowed-peer-ip`) SFU’ning `advertise_ip` qiymati bo‘lishi kerak, TURN va SFU bitta tarmoqda bo‘lsa — SFU’ning xususiy IP’si.
 4. Suiiste’molga qarshi: `user-quota` va `total-quota` (misolda 12 / 1200), IPv6 `denied-peer-ip` diapazonlari fayldagi izohlar bilan.
 5. Secret va hosil bo‘lgan credential hech qachon loglanmaydi.
+
+**Orqaga qaytarish (rollback):** konfiguratsiya `deny_unknown_fields` bilan o‘qiladi, shuning uchun `rooms.max_forwarded_audio` yoki `[media.turn]` bor TOML bilan eski binary ishga tushmaydi. Eski versiyaga qaytishdan oldin bu kalitlarni konfiguratsiyadan olib tashlang.
