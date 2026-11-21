@@ -193,8 +193,11 @@ struct FileTurnConfig {
     ttl_secs: u64,
 }
 
+/// 12 hours: the SDK reads `ice_servers` only when it (re)joins, so an ICE
+/// restart after the credential expired could not allocate a relay. The TTL
+/// must cover the longest meeting.
 fn default_turn_ttl_secs() -> u64 {
-    3600
+    43_200
 }
 
 /// Ephemeral TURN credentials (coturn `use-auth-secret`, TURN REST API).
@@ -206,7 +209,9 @@ pub struct TurnConfig {
     pub urls: Vec<String>,
     /// Shared secret; must equal coturn's `static-auth-secret`.
     pub secret: Secret,
-    /// Credential lifetime in seconds (default 3600, minimum 60).
+    /// Credential lifetime in seconds (default 43200 = 12 h, minimum 60).
+    /// Must cover the longest meeting: clients only get new credentials
+    /// when they rejoin.
     pub ttl_secs: u64,
 }
 
@@ -378,12 +383,15 @@ pub fn parse(
                 );
             }
             anyhow::ensure!(t.ttl_secs >= 60, "media.turn.ttl_secs must be at least 60");
+            // A secret read from a file into the environment often keeps its
+            // trailing newline, which would silently break every TURN login.
+            let trimmed_env = |name: &str| env(name).map(|v| v.trim().to_owned());
             let secret = resolve_secret(
                 "media.turn.secret",
                 t.secret_env.as_deref(),
                 t.secret.as_deref(),
                 production,
-                env,
+                &trimmed_env,
             )?;
             anyhow::ensure!(
                 !secret.expose().is_empty(),
@@ -563,7 +571,7 @@ listen = [{ bind_ip = "127.0.0.1" }]
         let ok = with("urls = [\"turns:t.example.com:443?transport=tcp\"]\nsecret = \"s\"");
         let turn = parse(&ok, Path::new("."), &no_env).unwrap().media.turn;
         let turn = turn.unwrap();
-        assert_eq!(turn.ttl_secs, 3600);
+        assert_eq!(turn.ttl_secs, 43_200);
         assert!(!format!("{turn:?}").contains("\"s\""));
 
         for (bad, needle) in [
@@ -587,5 +595,23 @@ listen = [{ bind_ip = "127.0.0.1" }]
             .unwrap_err()
             .to_string();
         assert!(error.contains("inline secrets"), "{error}");
+    }
+
+    #[test]
+    fn turn_secret_from_env_is_trimmed() {
+        let config = format!("{DEV}\n[media.turn]\nurls = [\"turn:x\"]\nsecret_env = \"TURN\"");
+        let env = |name: &str| (name == "TURN").then(|| "  s3cret\n".to_owned());
+        let turn = parse(&config, Path::new("."), &env)
+            .unwrap()
+            .media
+            .turn
+            .unwrap();
+        assert_eq!(turn.secret.expose(), "s3cret");
+
+        let blank = |name: &str| (name == "TURN").then(|| " \n".to_owned());
+        let error = parse(&config, Path::new("."), &blank)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("media.turn.secret"), "{error}");
     }
 }

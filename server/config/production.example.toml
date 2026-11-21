@@ -39,4 +39,7 @@ ice_servers = [
 # [media.turn]
 # urls = ["turns:<DOMAIN>:443?transport=tcp", "turn:<DOMAIN>:3478?transport=udp"]
 # secret_env = "ECOCHAIN_RTC_TURN_SECRET"   # inline `secret` is rejected in production
-# ttl_secs = 3600                            # default 3600, minimum 60
+# ttl_secs = 43200                           # default 43200 (12 h), minimum 60
+# ttl_secs must be >= the longest meeting: the SDK only refreshes TURN
+# credentials on rejoin, so an ICE restart after expiry cannot allocate.
+# A trailing newline in the secret env value is trimmed.
