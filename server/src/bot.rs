@@ -11,7 +11,7 @@ use crate::protocol::{ErrorCode, ProtocolError};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -204,6 +204,14 @@ pub struct BotOptions {
     pub simulcast: bool,
     /// Subscribe to at most this many remote video tracks.
     pub max_video: usize,
+    /// Audio level (dBov, negative) written into the RTP audio-level header.
+    pub audio_level: i8,
+    /// Negotiate the microphone but send no packets and tell the server the
+    /// track is muted, like the SDK does after `setMicrophoneEnabled(false)`.
+    pub audio_muted: bool,
+    /// The first this many video subscriptions use `"high"`, the rest
+    /// `"low"`. `usize::MAX` subscribes everything `"high"`.
+    pub high_video: usize,
 }
 
 /// Counters the bot updates while it runs.
@@ -229,6 +237,16 @@ pub struct BotStats {
     pub events: Vec<String>,
     /// Remote participants by id with their connected flag.
     pub remote_participants: Vec<(String, bool)>,
+    /// Audio frames received, by the participant that published them.
+    pub audio_frames_by_participant: HashMap<String, u64>,
+    /// Video frames received, by the participant that published them.
+    pub video_frames_by_participant: HashMap<String, u64>,
+    /// Tracks of remote participants: `(participant, track, kind)`.
+    pub remote_tracks: Vec<(String, String, String)>,
+    /// Video track ids this bot is currently subscribed to.
+    pub subscribed_video: Vec<String>,
+    /// `KeyframeRequest` events received by the publisher peer.
+    pub keyframe_requests: u64,
     /// Set when the bot stopped, with the reason.
     pub stopped: Option<String>,
 }
@@ -238,6 +256,10 @@ enum Control {
     Outage(Duration),
     SwitchNetwork,
     DropSignaling,
+    SubscribeVideo(String, &'static str),
+    UnsubscribeVideo(String),
+    SetAudioMuted(bool),
+    EnableAudio,
 }
 
 /// Handle to a running bot.
@@ -289,6 +311,31 @@ impl Bot {
         let _ = self.control.send(Control::DropSignaling);
     }
 
+    /// Subscribes to a remote video track with the given quality
+    /// (`"low" | "medium" | "high"`).
+    pub fn subscribe_video(&self, track_id: String, quality: &'static str) {
+        let _ = self
+            .control
+            .send(Control::SubscribeVideo(track_id, quality));
+    }
+
+    /// Drops the subscription to a remote video track.
+    pub fn unsubscribe_video(&self, track_id: String) {
+        let _ = self.control.send(Control::UnsubscribeVideo(track_id));
+    }
+
+    /// Mutes or unmutes the microphone: stops or resumes sending packets and
+    /// sends `track.mute`.
+    pub fn set_audio_muted(&self, muted: bool) {
+        let _ = self.control.send(Control::SetAudioMuted(muted));
+    }
+
+    /// Adds the microphone track to a bot that started without one and
+    /// renegotiates the publisher (the "first unmute").
+    pub fn enable_audio(&self) {
+        let _ = self.control.send(Control::EnableAudio);
+    }
+
     /// Leaves the room and waits for the task to finish.
     pub async fn leave(self) {
         let _ = self.control.send(Control::Leave);
@@ -333,6 +380,9 @@ struct Runner {
     sub_local: SocketAddr,
     outage_until: Option<Instant>,
     subscribed_video: Vec<String>,
+    audio_muted: bool,
+    /// Subscriber mid to the participant that publishes it.
+    mid_participant: HashMap<Mid, String>,
 }
 
 const LAYERS: [&str; 3] = ["q", "h", "f"];
@@ -351,6 +401,7 @@ impl Runner {
             .as_str()
             .map(str::to_owned);
         let (sub_socket, sub_local) = bind(options.bind_ip).await?;
+        let audio_muted = options.audio_muted;
         let mut runner = Self {
             publisher: new_publisher(options.bind_ip).await?,
             options,
@@ -362,6 +413,8 @@ impl Runner {
             subscriber: None,
             outage_until: None,
             subscribed_video: Vec::new(),
+            audio_muted,
+            mid_participant: HashMap::new(),
         };
         runner.record_participants(&joined["participants"]);
         runner.publish(false, false).await?;
@@ -408,13 +461,68 @@ impl Runner {
             // Keep candidates: switch_network already swapped them.
             change.ice_restart(true);
         }
-        let Some((offer, pending)) = change.apply() else {
+        let applied = change.apply();
+        self.send_publisher_offer(applied, reset).await?;
+        if !ice_restart && self.audio_muted && self.publisher.audio.is_some() {
+            self.send_mute(true).await?;
+        }
+        Ok(())
+    }
+
+    /// Adds the microphone to a bot that has none and renegotiates.
+    async fn enable_audio(&mut self) -> Result<(), BotError> {
+        if self.publisher.audio.is_some() {
+            return Ok(());
+        }
+        self.options.audio = true;
+        self.audio_muted = false;
+        let mut change = self.publisher.rtc.sdp_api();
+        self.publisher.audio = Some(change.add_media(
+            MediaKind::Audio,
+            Direction::SendOnly,
+            Some("bot".into()),
+            None,
+            None,
+        ));
+        let applied = change.apply();
+        self.send_publisher_offer(applied, false).await
+    }
+
+    /// The request the SDK sends from `_sendMute`.
+    async fn send_mute(&mut self, muted: bool) -> Result<(), BotError> {
+        self.signal
+            .request(
+                "track.mute",
+                json!({"source": "microphone", "muted": muted}),
+            )
+            .await
+            .map(|_| ())
+    }
+
+    async fn set_audio_muted(&mut self, muted: bool) -> Result<(), BotError> {
+        self.audio_muted = muted;
+        if self.publisher.audio.is_some() {
+            self.send_mute(muted).await?;
+        }
+        Ok(())
+    }
+
+    /// Applies `change`, sends the publisher offer with all current tracks
+    /// and accepts the answer.
+    async fn send_publisher_offer(
+        &mut self,
+        applied: Option<(SdpOffer, SdpPendingOffer)>,
+        reset: bool,
+    ) -> Result<(), BotError> {
+        let Some((offer, pending)) = applied else {
             return Ok(());
         };
         self.publisher.pending = Some(pending);
         let mut tracks = Vec::new();
         if let Some(mid) = self.publisher.audio {
-            tracks.push(json!({"mid": mid.to_string(), "source": "microphone"}));
+            tracks.push(
+                json!({"mid": mid.to_string(), "source": "microphone", "muted": self.audio_muted}),
+            );
         }
         if let Some(mid) = self.publisher.video {
             let layers: Vec<&str> = if self.options.simulcast {
@@ -469,6 +577,10 @@ impl Runner {
                     Some(Control::Outage(duration)) => self.outage_until = Some(Instant::now() + duration),
                     Some(Control::SwitchNetwork) => self.switch_network().await?,
                     Some(Control::DropSignaling) => self.reconnect_signaling().await?,
+                    Some(Control::SubscribeVideo(track, quality)) => self.subscribe_track(track, quality).await?,
+                    Some(Control::UnsubscribeVideo(track)) => self.unsubscribe_track(track).await?,
+                    Some(Control::SetAudioMuted(muted)) => self.set_audio_muted(muted).await?,
+                    Some(Control::EnableAudio) => self.enable_audio().await?,
                 },
                 received = self.publisher.socket.recv_from(&mut buf) => {
                     let mut next = received.ok();
@@ -541,6 +653,7 @@ impl Runner {
         if let Some(sub) = self.subscriber.as_mut() {
             rtcs.push((sub, &self.sub_socket));
         }
+        let mid_participant = &self.mid_participant;
         let mut stats = self.stats.lock().expect("stats");
         let mut keyframe = false;
         for (i, (rtc, socket)) in rtcs.into_iter().enumerate() {
@@ -559,18 +672,34 @@ impl Runner {
                     }
                     Output::Event(Event::MediaData(data)) if i == 1 => {
                         stats.bytes += data.data.len() as u64;
+                        let participant = mid_participant.get(&data.mid);
                         if data.params.spec().codec.is_audio() {
                             stats.audio_frames += 1;
                             stats.last_audio = Some(now);
+                            if let Some(p) = participant {
+                                *stats
+                                    .audio_frames_by_participant
+                                    .entry(p.clone())
+                                    .or_default() += 1;
+                            }
                         } else {
                             stats.video_frames += 1;
                             stats.last_video = Some(now);
                             if data.is_keyframe() {
                                 stats.video_keyframes += 1;
                             }
+                            if let Some(p) = participant {
+                                *stats
+                                    .video_frames_by_participant
+                                    .entry(p.clone())
+                                    .or_default() += 1;
+                            }
                         }
                     }
-                    Output::Event(Event::KeyframeRequest(_)) if i == 0 => keyframe = true,
+                    Output::Event(Event::KeyframeRequest(_)) if i == 0 => {
+                        keyframe = true;
+                        stats.keyframe_requests += 1;
+                    }
                     Output::Event(_) => {}
                 }
             }
@@ -586,7 +715,7 @@ impl Runner {
     fn send_media(&mut self, tick: u64) {
         let now = Instant::now();
         let publisher = &mut self.publisher;
-        if let Some(mid) = publisher.audio {
+        if let Some(mid) = publisher.audio.filter(|_| !self.audio_muted) {
             if let Some(writer) = publisher.rtc.writer(mid) {
                 if let Some(pt) = find_pt(&writer, Codec::Opus) {
                     publisher.audio_time += 960;
@@ -594,9 +723,12 @@ impl Runner {
                         publisher.audio_time,
                         str0m::media::Frequency::FORTY_EIGHT_KHZ,
                     );
-                    let _ = writer
-                        .audio_level(-25, true)
-                        .write(pt, now, time, vec![0xFCu8; 80]);
+                    let _ = writer.audio_level(self.options.audio_level, true).write(
+                        pt,
+                        now,
+                        time,
+                        vec![0xFCu8; 80],
+                    );
                 }
             }
         }
@@ -663,6 +795,17 @@ impl Runner {
                     .sdp_api()
                     .accept_offer(offer)
                     .map_err(|e| BotError::Rtc(e.to_string()))?;
+                self.mid_participant = data["tracks"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|t| {
+                        Some((
+                            Mid::from(t["mid"].as_str()?),
+                            t["participant_id"].as_str()?.to_owned(),
+                        ))
+                    })
+                    .collect();
                 let revision = data["revision"].clone();
                 let result = self
                     .signal
@@ -689,6 +832,11 @@ impl Runner {
                     .expect("stats")
                     .remote_participants
                     .retain(|(p, _)| p != id);
+                self.stats
+                    .lock()
+                    .expect("stats")
+                    .remote_tracks
+                    .retain(|(p, _, _)| p != id);
             }
             "peer.failed" => {
                 if data["target"] == "subscriber" {
@@ -721,7 +869,15 @@ impl Runner {
         let connected = participant["connected"].as_bool().unwrap_or(true);
         let mut stats = self.stats.lock().expect("stats");
         stats.remote_participants.retain(|(p, _)| *p != id);
-        stats.remote_participants.push((id, connected));
+        stats.remote_participants.push((id.clone(), connected));
+        stats.remote_tracks.retain(|(p, _, _)| *p != id);
+        for track in participant["tracks"].as_array().into_iter().flatten() {
+            stats.remote_tracks.push((
+                id.clone(),
+                track["track_id"].as_str().unwrap_or_default().to_owned(),
+                track["kind"].as_str().unwrap_or_default().to_owned(),
+            ));
+        }
     }
 
     async fn subscribe_videos(&mut self, participant: &Value) -> Result<(), BotError> {
@@ -732,16 +888,58 @@ impl Runner {
                 && !self.subscribed_video.contains(&id)
                 && self.subscribed_video.len() < self.options.max_video
             {
+                let quality = if self.subscribed_video.len() < self.options.high_video {
+                    "high"
+                } else {
+                    "low"
+                };
                 self.subscribed_video.push(id.clone());
-                changes.push(json!({"track_id": id, "subscribed": true, "quality": "high"}));
+                changes.push(json!({"track_id": id, "subscribed": true, "quality": quality}));
             }
         }
         if !changes.is_empty() {
             self.signal
                 .request("subscription.update", json!({"changes": changes}))
                 .await?;
+            self.publish_subscribed();
         }
         Ok(())
+    }
+
+    /// Subscribes to one more video track, beyond `max_video` if asked to.
+    async fn subscribe_track(
+        &mut self,
+        track_id: String,
+        quality: &'static str,
+    ) -> Result<(), BotError> {
+        if !self.subscribed_video.contains(&track_id) {
+            self.subscribed_video.push(track_id.clone());
+        }
+        self.signal
+            .request(
+                "subscription.update",
+                json!({"changes": [{"track_id": track_id, "subscribed": true, "quality": quality}]}),
+            )
+            .await?;
+        self.publish_subscribed();
+        Ok(())
+    }
+
+    async fn unsubscribe_track(&mut self, track_id: String) -> Result<(), BotError> {
+        self.subscribed_video.retain(|t| *t != track_id);
+        self.signal
+            .request(
+                "subscription.update",
+                json!({"changes": [{"track_id": track_id, "subscribed": false}]}),
+            )
+            .await?;
+        self.publish_subscribed();
+        Ok(())
+    }
+
+    /// Mirrors the subscription list into the stats.
+    fn publish_subscribed(&self) {
+        self.stats.lock().expect("stats").subscribed_video = self.subscribed_video.clone();
     }
 
     /// After an outage: make sure signaling still works, then restart ICE if

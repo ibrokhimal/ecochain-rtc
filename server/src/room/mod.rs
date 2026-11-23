@@ -6,6 +6,8 @@
 //! processes every command in order, concurrent joins, duplicate requests and
 //! a leave racing a reconnect are resolved deterministically without locks.
 
+mod audio;
+mod keyframe;
 mod media;
 mod participant;
 
@@ -17,12 +19,18 @@ use crate::{
     metrics::Metrics,
     protocol::{close_code, ErrorCode, Outbound, ProtocolError, SessionRequest},
     rooms::Rooms,
-    sfu::udp::{Datagram, MediaSockets, RoomPackets},
+    sfu::{
+        peer::PeerKind,
+        udp::{Datagram, MediaSockets, RoomPackets},
+    },
 };
+use audio::AudioSelector;
 use participant::Participant;
 use rand::{distributions::Alphanumeric, Rng};
 use serde_json::{json, Value};
 use std::{
+    collections::HashMap,
+    net::SocketAddr,
     sync::{atomic::Ordering, Arc, Weak},
     time::{Duration, Instant},
 };
@@ -139,16 +147,25 @@ pub fn spawn(
         .metrics
         .rooms_active
         .fetch_add(1, Ordering::Relaxed);
+    let audio = AudioSelector::new(services.config.rooms.max_forwarded_audio);
     let room = Room {
         id,
         max_participants,
         services,
         packets_tx,
         participants: Vec::new(),
+        routes: HashMap::new(),
+        forwarding: HashMap::new(),
+        slots: HashMap::new(),
+        forwarding_dirty: false,
         empty_since: Some(Instant::now()),
         empty_ttl_override: from_api.then_some(UNUSED_ROOM_TTL),
+        audio,
+        audio_generation: 0,
         speakers: Vec::new(),
-        last_speaker_check: Instant::now(),
+        last_speakers_sent: None,
+        speakers_due: None,
+        keyframes_due: None,
         ended: false,
     };
     tokio::spawn(room.run(commands_rx, packets_rx, handle.clone()));
@@ -161,10 +178,31 @@ pub(crate) struct Room {
     services: RoomServices,
     packets_tx: RoomPackets,
     participants: Vec<Participant>,
+    /// Source address -> owning peer, learned from datagrams. Only a hint:
+    /// every hit is verified with `Peer::accepts`.
+    routes: HashMap<SocketAddr, (String, PeerKind)>,
+    /// Track id -> ids of participants whose subscriber has it `Open`.
+    /// Rebuilt lazily (see `forwarding_dirty`); `forward` re-verifies entries.
+    forwarding: HashMap<String, Vec<String>>,
+    /// Participant id -> position in `participants`, valid with `forwarding`;
+    /// lookups re-check the id.
+    slots: HashMap<String, usize>,
+    /// Set wherever an `OutTrack` or subscriber peer changes.
+    forwarding_dirty: bool,
     empty_since: Option<Instant>,
     empty_ttl_override: Option<Duration>,
+    /// Decides which audio tracks are forwarded (the loudest N).
+    audio: AudioSelector,
+    /// `audio.generation()` when `speakers` was last computed.
+    audio_generation: u64,
+    /// Participant ids of the last `speakers.changed`, loudest first.
     speakers: Vec<String>,
-    last_speaker_check: Instant,
+    /// When the last `speakers.changed` was sent (throttle).
+    last_speakers_sent: Option<Instant>,
+    /// A speaker change held back by the throttle is sent at this time.
+    speakers_due: Option<Instant>,
+    /// Earliest deferred keyframe request of any track (may be stale-early).
+    keyframes_due: Option<Instant>,
     ended: bool,
 }
 
@@ -182,12 +220,18 @@ impl Room {
         addresses.mark_unchanged();
         while !self.ended {
             let deadline = self.next_timeout();
+            // Set by the arm that woke the loop: time before that is waiting.
+            let woke;
             tokio::select! {
                 command = commands.recv() => match command {
-                    Some(command) => self.handle_command(command),
+                    Some(command) => {
+                        woke = Instant::now();
+                        self.handle_command(command)
+                    }
                     None => break,
                 },
                 Some(datagram) = packets.recv() => {
+                    woke = Instant::now();
                     self.handle_datagram(datagram);
                     // Drain what is already queued before polling peers, so a
                     // burst of packets is handled in one pass.
@@ -195,11 +239,21 @@ impl Room {
                         self.handle_datagram(datagram);
                     }
                 }
-                _ = tokio::time::sleep_until(deadline.into()) => {}
-                _ = tick.tick() => self.housekeeping(),
-                Ok(()) = addresses.changed() => self.media_addresses_changed(),
+                _ = tokio::time::sleep_until(deadline.into()) => woke = Instant::now(),
+                _ = tick.tick() => {
+                    woke = Instant::now();
+                    self.housekeeping()
+                }
+                Ok(()) = addresses.changed() => {
+                    woke = Instant::now();
+                    self.media_addresses_changed()
+                }
             }
             self.drive();
+            self.services
+                .metrics
+                .room_busy_micros_total
+                .fetch_add(woke.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
 
         // Deregister first so new joins create a fresh room instead of
@@ -375,6 +429,7 @@ impl Room {
                 let participant =
                     Participant::new(random_id("PA_"), claims, random_id("SE_"), conn.clone());
                 self.participants.push(participant);
+                self.forwarding_dirty = true;
                 self.empty_since = None;
                 self.empty_ttl_override = None;
                 self.services
@@ -402,8 +457,21 @@ impl Room {
             );
         }
 
+        let speakers: Vec<String> = self
+            .current_speakers(Instant::now())
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
         let participant = &self.participants[index];
         let config = &self.services.config;
+        let mut ice_servers = config.media.ice_servers.clone();
+        if let Some(turn) = &config.media.turn {
+            ice_servers.push(crate::turn::credentials(
+                turn,
+                &claims.sub,
+                crate::auth::unix_now(),
+            ));
+        }
         let data = json!({
             "protocol": crate::protocol::PROTOCOL_VERSION,
             "session_id": participant.session_id,
@@ -418,8 +486,8 @@ impl Room {
                 "max_participants": self.max_participants,
                 "max_video_subscriptions": config.rooms.max_video_subscriptions,
             },
-            "speakers": self.speakers,
-            "ice_servers": config.media.ice_servers,
+            "speakers": speakers,
+            "ice_servers": ice_servers,
             "reconnect_grace_ms": config.rooms.reconnect_grace().as_millis() as u64,
             "heartbeat_interval_ms": crate::signaling::HEARTBEAT_INTERVAL.as_millis() as u64,
         });
@@ -664,6 +732,8 @@ impl Room {
     fn remove_participant(&mut self, index: usize, reason: Option<&str>) {
         self.close_media(index);
         let participant = self.participants.remove(index);
+        self.forwarding_dirty = true;
+        self.forget_routes(&participant.id, None);
         self.services
             .metrics
             .participants_active

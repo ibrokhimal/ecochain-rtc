@@ -23,7 +23,8 @@ use crate::{
 };
 use serde_json::json;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
+    net::SocketAddr,
     sync::atomic::Ordering,
     time::{Duration, Instant},
 };
@@ -44,16 +45,9 @@ use str0m::{
 /// meantime go into the next offer, after the answer arrives.
 const OFFER_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Minimum spacing of keyframe requests to one publisher track. Keyframes
-/// are large; asking too often hurts everybody's bandwidth.
-const KEYFRAME_THROTTLE: Duration = Duration::from_millis(500);
-
-/// Window for active speaker detection.
-const SPEAKER_WINDOW: Duration = Duration::from_millis(500);
-
-/// Linear audio level (0..1) above which a participant counts as speaking.
-/// 0.03 is about -30 dBov, quieter than normal speech, louder than room noise.
-const SPEAKING_LEVEL: f32 = 0.03;
+/// Minimum spacing of `speakers.changed` events. A change inside this
+/// window is sent when it ends.
+const SPEAKERS_THROTTLE: Duration = Duration::from_millis(250);
 
 /// Upper bound of drive iterations per wakeup, to keep one room from
 /// starving others if events keep producing events.
@@ -63,6 +57,12 @@ impl Room {
     /// Earliest timer of any peer, but never later than the next tick.
     pub(super) fn next_timeout(&self) -> Instant {
         let mut next = Instant::now() + super::TICK;
+        if let Some(due) = self.speakers_due {
+            next = next.min(due);
+        }
+        if let Some(due) = self.keyframes_due {
+            next = next.min(due);
+        }
         for participant in &self.participants {
             if let Some(peer) = &participant.publisher {
                 next = next.min(peer.next_timeout());
@@ -75,28 +75,70 @@ impl Room {
     }
 
     pub(super) fn handle_datagram(&mut self, datagram: Datagram) {
-        for index in 0..self.participants.len() {
-            for kind in [PeerKind::Publisher, PeerKind::Subscriber] {
-                let Some(peer) = self.peer_mut(index, kind) else {
-                    continue;
-                };
-                if peer.accepts(&datagram) {
-                    if let Err(e) = peer.handle_datagram(&datagram) {
-                        tracing::debug!(error = ?e, "peer rejected datagram");
-                        self.fail_peer(index, kind);
-                    }
+        // Fast path: the source address was seen before. The cached peer is
+        // always verified with `accepts`, so a stale entry only costs a scan.
+        let cached = self.routes.get(&datagram.source).cloned();
+        if let Some((participant_id, kind)) = cached {
+            if let Some(index) = self.index_of(&participant_id) {
+                if self.deliver(index, kind, &datagram) {
                     return;
                 }
             }
         }
+        for index in 0..self.participants.len() {
+            for kind in [PeerKind::Publisher, PeerKind::Subscriber] {
+                if self.deliver(index, kind, &datagram) {
+                    let id = self.participants[index].id.clone();
+                    insert_route(&mut self.routes, datagram.source, id, kind);
+                    return;
+                }
+            }
+        }
+        self.routes.remove(&datagram.source);
         self.services
             .metrics
             .udp_dropped(crate::metrics::UdpDrop::NoPeer);
     }
 
+    /// Hands the datagram to the peer if it accepts it. Returns whether it did.
+    fn deliver(&mut self, index: usize, kind: PeerKind, datagram: &Datagram) -> bool {
+        let Some(peer) = self.peer_mut(index, kind) else {
+            return false;
+        };
+        if !peer.accepts(datagram) {
+            return false;
+        }
+        if let Err(e) = peer.handle_datagram(datagram) {
+            tracing::debug!(error = ?e, "peer rejected datagram");
+            self.fail_peer(index, kind);
+        }
+        true
+    }
+
+    /// Drops cached routes to a participant's peers (`None` = both). Called
+    /// wherever a peer is closed or replaced, and on participant removal, which
+    /// also keeps the cache bounded.
+    pub(super) fn forget_routes(&mut self, participant_id: &str, kind: Option<PeerKind>) {
+        self.routes
+            .retain(|_, (id, k)| !(id == participant_id && kind.is_none_or(|kind| kind == *k)));
+    }
+
+    /// Advances all peers, then announces a speaker change if the audio
+    /// selection changed or a throttled change is due.
+    pub(super) fn drive(&mut self) {
+        self.flush_keyframes(Instant::now());
+        self.drive_peers();
+        let now = Instant::now();
+        if self.audio.generation() != self.audio_generation
+            || self.speakers_due.is_some_and(|due| due <= now)
+        {
+            self.update_speakers(now);
+        }
+    }
+
     /// Advances all peers, sends their datagrams and processes their events
     /// until nothing new happens.
-    pub(super) fn drive(&mut self) {
+    fn drive_peers(&mut self) {
         for _ in 0..MAX_DRIVE_ROUNDS {
             let now = Instant::now();
             let mut produced = Vec::new();
@@ -154,11 +196,14 @@ impl Room {
     /// so it can rebuild that peer (`publisher.offer` with `reset` or
     /// `subscriber.reset`).
     fn fail_peer(&mut self, index: usize, kind: PeerKind) {
+        self.forwarding_dirty = true;
         self.services
             .metrics
             .peer_failures_total
             .fetch_add(1, Ordering::Relaxed);
         let sockets = self.services.sockets.clone();
+        let participant_id = self.participants[index].id.clone();
+        self.forget_routes(&participant_id, Some(kind));
         let target = match kind {
             PeerKind::Publisher => {
                 if let Some(mut peer) = self.participants[index].publisher.take() {
@@ -196,7 +241,7 @@ impl Room {
                     out.publisher_id.clone(),
                     out.current_rid.or(out.target_rid),
                 );
-                self.request_keyframe(&publisher_id, &track_id, rid, request.kind);
+                self.request_keyframe(&publisher_id, &track_id, rid, request.kind, false);
             }
             (
                 PeerKind::Subscriber,
@@ -247,6 +292,8 @@ impl Room {
 
         let sockets = self.services.sockets.clone();
         if reset {
+            let participant_id = self.participants[index].id.clone();
+            self.forget_routes(&participant_id, Some(PeerKind::Publisher));
             if let Some(mut old) = self.participants[index].publisher.take() {
                 old.close(&sockets);
             }
@@ -287,7 +334,18 @@ impl Room {
             {
                 track.muted = offered.muted;
                 track.layers = layers;
+                // Gates of layers that are gone would only keep deferred
+                // requests for a rid the publisher no longer sends.
+                let known = &track.layers;
+                track
+                    .keyframes
+                    .retain(|rid, _| super::keyframe::is_known_layer(known, *rid));
                 kept.insert(track.id.clone());
+                if track.muted {
+                    // replaceTrack(null) sends nothing more that could
+                    // release the slot.
+                    self.audio.remove(&track.id);
+                }
             } else {
                 let track = PublishedTrack {
                     id: random_id("TR_"),
@@ -300,7 +358,7 @@ impl Room {
                     source: offered.source,
                     muted: offered.muted,
                     layers,
-                    last_keyframe_request: None,
+                    keyframes: HashMap::new(),
                     orientation: None,
                 };
                 kept.insert(track.id.clone());
@@ -322,11 +380,17 @@ impl Room {
     /// Removes published tracks of `index` that are not in `keep` (all of
     /// them when `keep` is `None`) and stops forwarding them.
     fn unpublish(&mut self, index: usize, keep: Option<&HashSet<String>>) {
+        self.forwarding_dirty = true;
         let participant = &mut self.participants[index];
+        let audio = &mut self.audio;
         let before = participant.tracks.len();
-        participant
-            .tracks
-            .retain(|t| keep.is_some_and(|keep| keep.contains(&t.id)));
+        participant.tracks.retain(|t| {
+            let kept = keep.is_some_and(|keep| keep.contains(&t.id));
+            if !kept {
+                audio.remove(&t.id);
+            }
+            kept
+        });
         if participant.tracks.len() == before {
             return;
         }
@@ -360,6 +424,10 @@ impl Room {
             .ok_or_else(|| {
                 ProtocolError::new(ErrorCode::InvalidState, "source is not published")
             })?;
+        if muted && track.kind == MediaKind::Audio {
+            // replaceTrack(null) sends nothing more that could release the slot.
+            self.audio.remove(&track.id);
+        }
         if track.muted != muted {
             track.muted = muted;
             let info = participant.info();
@@ -398,6 +466,7 @@ impl Room {
     }
 
     pub(super) fn create_subscriber(&mut self, index: usize) {
+        self.forwarding_dirty = true;
         let peer = Peer::new(
             PeerKind::Subscriber,
             &self.services.sockets,
@@ -409,6 +478,9 @@ impl Room {
     }
 
     pub(super) fn reset_subscriber(&mut self, index: usize) {
+        self.forwarding_dirty = true;
+        let participant_id = self.participants[index].id.clone();
+        self.forget_routes(&participant_id, Some(PeerKind::Subscriber));
         if let Some(mut old) = self.participants[index].subscriber.take() {
             old.peer.close(&self.services.sockets);
         }
@@ -450,6 +522,7 @@ impl Room {
             .refresh_ufrag(&self.services.sockets, &self.packets_tx);
         sub.peer.wake(Instant::now());
 
+        self.forwarding_dirty = true;
         let mut opened = Vec::new();
         for out in &mut sub.out {
             if let OutState::Negotiating(mid) = out.state {
@@ -467,7 +540,13 @@ impl Room {
             .retain(|o| !matches!(o.state, OutState::NegotiatingStop(_)));
         // A new video receiver can only start decoding at a keyframe.
         for (publisher_id, track_id, rid) in opened {
-            self.request_keyframe(&publisher_id, &track_id, rid, KeyframeRequestKind::Pli);
+            self.request_keyframe(
+                &publisher_id,
+                &track_id,
+                rid,
+                KeyframeRequestKind::Pli,
+                true,
+            );
         }
         Ok(())
     }
@@ -599,6 +678,7 @@ impl Room {
     /// at that point every entry is `ToOpen`, `Open` or `ToStop`. Quality
     /// changes apply immediately.
     fn reconcile(&mut self, index: usize) {
+        self.forwarding_dirty = true;
         let desired = self.desired_tracks(index);
         let participant = &mut self.participants[index];
         let wanted: HashSet<&str> = desired.iter().map(|d| d.track_id.as_str()).collect();
@@ -686,6 +766,7 @@ impl Room {
         if *ice_restart {
             change.ice_restart(true);
         }
+        self.forwarding_dirty = true;
         for track in out.iter_mut() {
             match track.state {
                 OutState::ToOpen => {
@@ -750,37 +831,64 @@ impl Room {
         let Some(track) = publisher.tracks.iter_mut().find(|t| t.mid == data.mid) else {
             return;
         };
+        if data.is_keyframe() {
+            // The deferred request, if any, is satisfied. Never inserts: the
+            // rid comes from the network.
+            if let Some(gate) = track.keyframes.get_mut(&data.rid) {
+                gate.keyframe_received();
+            }
+        }
         if data.ext_vals.video_orientation.is_some() {
             track.orientation = data.ext_vals.video_orientation;
         }
-        let (track_id, kind, orientation) = (track.id.clone(), track.kind, track.orientation);
+        let (track_id, kind, orientation, muted) =
+            (track.id.clone(), track.kind, track.orientation, track.muted);
         let publisher_id = publisher.id.clone();
+        let now = Instant::now();
 
         let mut audio_level = None;
         if kind == MediaKind::Audio {
-            if let Some(level) = data.ext_vals.audio_level {
-                // RFC 6464: level is -dBov, 0 is loudest, -127 silence.
-                let linear = 10f32.powf(f32::from(level.min(0)) / 20.0);
-                publisher.level_sum += linear;
-                publisher.level_count += 1;
-                audio_level = Some((level, data.ext_vals.voice_activity.unwrap_or(false)));
+            // RFC 6464: level is -dBov, 0 is loudest, -127 silence.
+            let level = data.ext_vals.audio_level;
+            let voice = data.ext_vals.voice_activity.unwrap_or(false);
+            // Only a few tracks reach subscribers; the m-lines of the others
+            // stay negotiated and simply carry no packets.
+            if !self.audio.observe(&track_id, level, voice, muted, now) {
+                return;
             }
+            audio_level = level.map(|l| (l, voice));
         } else if !data.contiguous {
             // Packets were lost beyond what NACK recovered; the decoder
             // needs a fresh keyframe.
-            self.request_keyframe(&publisher_id, &track_id, data.rid, KeyframeRequestKind::Pli);
+            self.request_keyframe(
+                &publisher_id,
+                &track_id,
+                data.rid,
+                KeyframeRequestKind::Pli,
+                false,
+            );
         }
 
-        let now = Instant::now();
+        if self.forwarding_dirty {
+            self.rebuild_forwarding();
+        }
         let mut written = 0u64;
-        let mut wanted_keyframe = Vec::new();
-        for (other_index, other) in self.participants.iter_mut().enumerate() {
-            if other_index == index {
+        let mut wanted_keyframe: Vec<Option<Rid>> = Vec::new();
+        let subscribers = self.forwarding.get(&track_id).map(Vec::as_slice);
+        for subscriber_id in subscribers.unwrap_or_default() {
+            let Some(&slot) = self.slots.get(subscriber_id) else {
+                continue;
+            };
+            let Some(other) = self.participants.get_mut(slot) else {
+                continue;
+            };
+            if slot == index || other.id != *subscriber_id {
                 continue;
             }
             let Some(sub) = other.subscriber.as_mut() else {
                 continue;
             };
+            // The index is only a hint; never write to a mid that is not open.
             let Some((out, mid)) = sub.out.iter_mut().find_map(|o| match o.state {
                 OutState::Open(mid) if o.track_id == track_id => Some((o, mid)),
                 _ => None,
@@ -794,7 +902,9 @@ impl Room {
                     continue;
                 }
                 if !data.is_keyframe() {
-                    wanted_keyframe.push(out.target_rid);
+                    if !wanted_keyframe.contains(&out.target_rid) {
+                        wanted_keyframe.push(out.target_rid);
+                    }
                     continue;
                 }
                 switched = out.current_rid.is_some();
@@ -826,16 +936,47 @@ impl Room {
             .media_out_total
             .fetch_add(written, Ordering::Relaxed);
         for rid in wanted_keyframe {
-            self.request_keyframe(&publisher_id, &track_id, rid, KeyframeRequestKind::Pli);
+            self.request_keyframe(
+                &publisher_id,
+                &track_id,
+                rid,
+                KeyframeRequestKind::Pli,
+                false,
+            );
         }
     }
 
+    /// Rebuilds `forwarding` from the `Open` entries of every subscriber.
+    pub(super) fn rebuild_forwarding(&mut self) {
+        self.forwarding.clear();
+        self.slots.clear();
+        for (slot, participant) in self.participants.iter().enumerate() {
+            self.slots.insert(participant.id.clone(), slot);
+            let Some(sub) = participant.subscriber.as_ref() else {
+                continue;
+            };
+            for out in &sub.out {
+                if matches!(out.state, OutState::Open(_)) {
+                    self.forwarding
+                        .entry(out.track_id.clone())
+                        .or_default()
+                        .push(participant.id.clone());
+                }
+            }
+        }
+        self.forwarding_dirty = false;
+    }
+
+    /// Asks the publisher for a keyframe of one layer. Requests inside the
+    /// layer's throttle window are deferred and sent by `flush_keyframes`.
+    /// `urgent` (new subscription, layer switch) uses a shorter window.
     fn request_keyframe(
         &mut self,
         publisher_id: &str,
         track_id: &str,
         rid: Option<Rid>,
         kind: KeyframeRequestKind,
+        urgent: bool,
     ) {
         let Some(index) = self.index_of(publisher_id) else {
             return;
@@ -844,23 +985,63 @@ impl Room {
         let Some(track) = participant.tracks.iter_mut().find(|t| t.id == track_id) else {
             return;
         };
-        let now = Instant::now();
-        if track
-            .last_keyframe_request
-            .is_some_and(|at| now - at < KEYFRAME_THROTTLE)
-        {
+        // Only layers the track really has: the rid may come from the network.
+        if !super::keyframe::is_known_layer(&track.layers, rid) {
             return;
         }
+        let now = Instant::now();
+        let gate = track.keyframes.entry(rid).or_default();
+        if !gate.request(now, urgent) {
+            if let Some(due) = gate.due() {
+                self.keyframes_due = Some(self.keyframes_due.map_or(due, |d| d.min(due)));
+            }
+            return;
+        }
+        let mid = track.mid;
+        Self::send_keyframe_request(participant, mid, rid, kind, now);
+    }
+
+    fn send_keyframe_request(
+        participant: &mut super::participant::Participant,
+        mid: Mid,
+        rid: Option<Rid>,
+        kind: KeyframeRequestKind,
+        now: Instant,
+    ) {
         let Some(peer) = participant.publisher.as_mut() else {
             return;
         };
-        let Some(mut writer) = peer.rtc.writer(track.mid) else {
+        let Some(mut writer) = peer.rtc.writer(mid) else {
             return;
         };
         if writer.is_request_keyframe_possible(kind) && writer.request_keyframe(rid, kind).is_ok() {
-            track.last_keyframe_request = Some(now);
             peer.wake(now);
         }
+    }
+
+    /// Sends the keyframe requests whose deferral has ended.
+    pub(super) fn flush_keyframes(&mut self, now: Instant) {
+        if self.keyframes_due.is_none_or(|due| due > now) {
+            return;
+        }
+        let mut next: Option<Instant> = None;
+        for participant in &mut self.participants {
+            let mut due = Vec::new();
+            for track in &mut participant.tracks {
+                for (rid, gate) in &mut track.keyframes {
+                    if gate.take_due(now) {
+                        due.push((track.mid, *rid));
+                    }
+                    if let Some(at) = gate.due() {
+                        next = Some(next.map_or(at, |n| n.min(at)));
+                    }
+                }
+            }
+            for (mid, rid) in due {
+                Self::send_keyframe_request(participant, mid, rid, KeyframeRequestKind::Pli, now);
+            }
+        }
+        self.keyframes_due = next;
     }
 
     /// Picks the simulcast layer per forwarded video track from requested
@@ -905,7 +1086,12 @@ impl Room {
             let out = &mut sub.out[i];
             if out.target_rid != target {
                 out.target_rid = target;
-                changed.push((out.publisher_id.clone(), out.track_id.clone(), target));
+                // An out that is not open yet gets its urgent request when
+                // the answer opens it; asking now would burn the throttle
+                // window before the m-line can receive the keyframe.
+                if matches!(out.state, OutState::Open(_)) {
+                    changed.push((out.publisher_id.clone(), out.track_id.clone(), target));
+                }
             }
         }
         // Let the estimator probe up to what the receiver asked for.
@@ -917,12 +1103,21 @@ impl Room {
             sub.peer.wake(Instant::now());
         }
         for (publisher_id, track_id, rid) in changed {
-            self.request_keyframe(&publisher_id, &track_id, rid, KeyframeRequestKind::Pli);
+            self.request_keyframe(
+                &publisher_id,
+                &track_id,
+                rid,
+                KeyframeRequestKind::Pli,
+                true,
+            );
         }
     }
 
     /// Tears down both peers of a participant and unpublishes its tracks.
     pub(super) fn close_media(&mut self, index: usize) {
+        self.forwarding_dirty = true;
+        let participant_id = self.participants[index].id.clone();
+        self.forget_routes(&participant_id, None);
         let sockets = self.services.sockets.clone();
         let participant = &mut self.participants[index];
         if let Some(mut peer) = participant.publisher.take() {
@@ -958,37 +1153,57 @@ impl Room {
             self.allocate_layers(index);
         }
 
-        if now - self.last_speaker_check >= SPEAKER_WINDOW {
-            self.last_speaker_check = now;
-            self.update_speakers();
-        }
+        // Expires stalled speakers and picks up order changes.
+        self.update_speakers(now);
     }
 
-    fn update_speakers(&mut self) {
-        let mut levels: Vec<(String, f32)> = Vec::new();
-        for participant in &mut self.participants {
-            if participant.level_count > 0 {
-                let average = participant.level_sum / participant.level_count as f32;
-                if average >= SPEAKING_LEVEL {
-                    levels.push((participant.id.clone(), average));
-                }
-            }
-            participant.level_sum = 0.0;
-            participant.level_count = 0;
-        }
-        levels.sort_by(|a, b| b.1.total_cmp(&a.1));
-        levels.truncate(3);
-        let ids: Vec<String> = levels.iter().map(|(id, _)| id.clone()).collect();
-        if ids != self.speakers {
-            self.speakers = ids;
-            let speakers: Vec<_> = levels
+    /// Current speakers by participant, loudest first, with the smoothed
+    /// linear level. Stalled tracks are expired first.
+    pub(super) fn current_speakers(&mut self, now: Instant) -> Vec<(String, f32)> {
+        self.audio.expire(now);
+        let mut speakers: Vec<(String, f32)> = Vec::new();
+        for (track_id, level) in self.audio.speaker_levels() {
+            let Some(publisher) = self
+                .participants
                 .iter()
-                .map(|(id, level)| json!({"participant_id": id, "level": (level * 100.0).round() / 100.0}))
-                .collect();
-            let event = Outbound::event("speakers.changed", json!({"speakers": speakers}));
-            for participant in &self.participants {
-                participant.send(event.clone());
+                .find(|p| p.tracks.iter().any(|t| t.id == track_id))
+            else {
+                continue;
+            };
+            // Loudest first: a second track of the same participant is quieter.
+            if !speakers.iter().any(|(id, _)| *id == publisher.id) {
+                speakers.push((publisher.id.clone(), level));
             }
+        }
+        speakers
+    }
+
+    /// Sends `speakers.changed` when the speaker list changed, at most once
+    /// per `SPEAKERS_THROTTLE`; a held back change is sent via `speakers_due`.
+    fn update_speakers(&mut self, now: Instant) {
+        let levels = self.current_speakers(now);
+        self.audio_generation = self.audio.generation();
+        let ids: Vec<String> = levels.iter().map(|(id, _)| id.clone()).collect();
+        if ids == self.speakers {
+            self.speakers_due = None;
+            return;
+        }
+        if let Some(last) = self.last_speakers_sent {
+            if now.saturating_duration_since(last) < SPEAKERS_THROTTLE {
+                self.speakers_due = Some(last + SPEAKERS_THROTTLE);
+                return;
+            }
+        }
+        self.speakers = ids;
+        self.last_speakers_sent = Some(now);
+        self.speakers_due = None;
+        let speakers: Vec<_> = levels
+            .iter()
+            .map(|(id, level)| json!({"participant_id": id, "level": (level * 100.0).round() / 100.0}))
+            .collect();
+        let event = Outbound::event("speakers.changed", json!({"speakers": speakers}));
+        for participant in &self.participants {
+            participant.send(event.clone());
         }
     }
 }
@@ -1029,4 +1244,68 @@ fn validate_tracks(tracks: &[OfferedTrack]) -> Result<(), ProtocolError> {
         }
     }
     Ok(())
+}
+
+/// Most source addresses cached per peer. A client may legitimately use a few
+/// (network switch, several candidate pairs); more would only let it grow the
+/// cache.
+const MAX_ROUTES_PER_PEER: usize = 4;
+
+/// Caches `source` for a peer, evicting another address of the same peer when
+/// it already has `MAX_ROUTES_PER_PEER`.
+fn insert_route(
+    routes: &mut HashMap<SocketAddr, (String, PeerKind)>,
+    source: SocketAddr,
+    participant_id: String,
+    kind: PeerKind,
+) {
+    let mut own = routes
+        .iter()
+        .filter(|(addr, (id, k))| **addr != source && *id == participant_id && *k == kind)
+        .map(|(addr, _)| *addr);
+    let count = own.clone().count();
+    if count >= MAX_ROUTES_PER_PEER {
+        if let Some(victim) = own.next() {
+            routes.remove(&victim);
+        }
+    }
+    routes.insert(source, (participant_id, kind));
+}
+
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+
+    #[test]
+    fn routes_per_peer_are_capped() {
+        let mut routes = HashMap::new();
+        for port in 1000..1100u16 {
+            let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+            insert_route(&mut routes, addr, "a".into(), PeerKind::Publisher);
+        }
+        let other: SocketAddr = ([127, 0, 0, 2], 1).into();
+        insert_route(&mut routes, other, "b".into(), PeerKind::Publisher);
+        let sub: SocketAddr = ([127, 0, 0, 3], 1).into();
+        insert_route(&mut routes, sub, "a".into(), PeerKind::Subscriber);
+        let count = |routes: &HashMap<SocketAddr, (String, PeerKind)>, id: &str, kind| {
+            routes
+                .values()
+                .filter(|(i, k)| i == id && *k == kind)
+                .count()
+        };
+        assert_eq!(
+            count(&routes, "a", PeerKind::Publisher),
+            MAX_ROUTES_PER_PEER
+        );
+        assert_eq!(count(&routes, "b", PeerKind::Publisher), 1);
+        assert_eq!(count(&routes, "a", PeerKind::Subscriber), 1);
+        // The newest address is always kept; re-inserting a known one is free.
+        let newest: SocketAddr = ([127, 0, 0, 1], 1099).into();
+        assert!(routes.contains_key(&newest));
+        insert_route(&mut routes, newest, "a".into(), PeerKind::Publisher);
+        assert_eq!(
+            count(&routes, "a", PeerKind::Publisher),
+            MAX_ROUTES_PER_PEER
+        );
+    }
 }

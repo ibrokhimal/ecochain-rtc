@@ -13,8 +13,9 @@ admin_key = "dev-only-admin-key"
 [rooms]
 auto_create = true
 default_max_participants = 25
-max_participants_limit = 100
+max_participants_limit = 150
 max_video_subscriptions = 9
+max_forwarded_audio = 3       # only the loudest this many speakers are forwarded (1..=8)
 reconnect_grace_secs = 30
 empty_room_ttl_secs = 60
 removal_memory_secs = 86400   # host removal lasts at least this long (and until the removed token expires)

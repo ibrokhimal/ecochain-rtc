@@ -1,5 +1,6 @@
 //! Per-participant state owned by the room task.
 
+use super::keyframe::KeyframeGate;
 use crate::{
     auth::{Claims, Role},
     protocol::{
@@ -54,8 +55,8 @@ pub struct PublishedTrack {
     pub muted: bool,
     /// Simulcast rids, lowest quality first. Empty without simulcast.
     pub layers: Vec<Rid>,
-    /// Last keyframe request sent to the publisher, for throttling.
-    pub last_keyframe_request: Option<Instant>,
+    /// Keyframe request throttling per layer (`None` = no simulcast).
+    pub keyframes: HashMap<Option<Rid>, KeyframeGate>,
     /// Last camera rotation the publisher signalled (RTP
     /// `urn:3gpp:video-orientation`). Phones send unrotated frames plus this
     /// value; it is copied onto every forwarded frame so that receivers,
@@ -265,10 +266,6 @@ pub struct Participant {
     pub muted_audio: HashSet<String>,
     /// Duplicate request detection.
     pub responses: ResponseCache,
-    /// Sum of linear audio levels in the current speaker window.
-    pub level_sum: f32,
-    /// Number of samples in `level_sum`.
-    pub level_count: u32,
 }
 
 impl Participant {
@@ -290,8 +287,6 @@ impl Participant {
             video_subscriptions: HashMap::new(),
             muted_audio: HashSet::new(),
             responses: ResponseCache::default(),
-            level_sum: 0.0,
-            level_count: 0,
         }
     }
 

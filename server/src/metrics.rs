@@ -30,6 +30,9 @@ pub struct Metrics {
     pub media_in_total: AtomicU64,
     /// RTP media units written to subscribers.
     pub media_out_total: AtomicU64,
+    /// Time room tasks spent handling commands, datagrams and polling peers
+    /// (not waiting), in microseconds, summed over all rooms.
+    pub room_busy_micros_total: AtomicU64,
     /// Dropped UDP datagrams, by [`UdpDrop`] reason.
     udp_dropped: [AtomicU64; UdpDrop::ALL.len()],
     join_failures: Mutex<BTreeMap<&'static str, u64>>,
@@ -157,6 +160,11 @@ impl Metrics {
         );
         let _ = writeln!(
             out,
+            "# HELP ecochain_rtc_room_busy_seconds_total Time room tasks spent working rather than waiting.\n# TYPE ecochain_rtc_room_busy_seconds_total counter\necochain_rtc_room_busy_seconds_total {:.6}",
+            load(&self.room_busy_micros_total) as f64 / 1_000_000.0,
+        );
+        let _ = writeln!(
+            out,
             "# HELP ecochain_rtc_udp_dropped_total Dropped UDP datagrams by reason.\n# TYPE ecochain_rtc_udp_dropped_total counter"
         );
         for reason in UdpDrop::ALL {
@@ -193,5 +201,11 @@ mod tests {
         let text = metrics.render();
         assert!(text.contains("ecochain_rtc_join_failures_total{code=\"room_full\"} 2"));
         assert!(text.contains("ecochain_rtc_rooms_active 0"));
+        metrics
+            .room_busy_micros_total
+            .fetch_add(1_500_000, Ordering::Relaxed);
+        assert!(metrics
+            .render()
+            .contains("ecochain_rtc_room_busy_seconds_total 1.500000"));
     }
 }

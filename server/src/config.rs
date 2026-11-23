@@ -124,6 +124,10 @@ pub struct RoomsConfig {
     /// receive at the same time. This is separate from `max_participants`:
     /// a 25 person room does not mean a phone decodes 24 videos.
     pub max_video_subscriptions: usize,
+    /// How many audio tracks are forwarded at the same time: only the
+    /// loudest this many speakers are heard, so a 100 person room does not
+    /// send every receiver 99 audio streams. 1..=8.
+    pub max_forwarded_audio: usize,
     /// How long a participant whose signaling socket dropped keeps its seat
     /// and media while waiting for a resume.
     pub reconnect_grace_secs: u64,
@@ -143,8 +147,9 @@ impl Default for RoomsConfig {
         Self {
             auto_create: false,
             default_max_participants: 25,
-            max_participants_limit: 100,
+            max_participants_limit: 150,
             max_video_subscriptions: 9,
+            max_forwarded_audio: 3,
             reconnect_grace_secs: 30,
             empty_room_ttl_secs: 60,
             ended_room_memory_secs: 24 * 3600,
@@ -175,6 +180,39 @@ struct FileMediaConfig {
     ice_servers: Vec<IceServer>,
     #[serde(default = "default_true")]
     follow_primary: bool,
+    turn: Option<FileTurnConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileTurnConfig {
+    urls: Vec<String>,
+    secret_env: Option<String>,
+    secret: Option<String>,
+    #[serde(default = "default_turn_ttl_secs")]
+    ttl_secs: u64,
+}
+
+/// 12 hours: the SDK reads `ice_servers` only when it (re)joins, so an ICE
+/// restart after the credential expired could not allocate a relay. The TTL
+/// must cover the longest meeting.
+fn default_turn_ttl_secs() -> u64 {
+    43_200
+}
+
+/// Ephemeral TURN credentials (coturn `use-auth-secret`, TURN REST API).
+/// Every join gets its own time-limited username and credential derived from
+/// `secret`, so no static TURN password ships to clients.
+#[derive(Debug, Clone)]
+pub struct TurnConfig {
+    /// `turn:` / `turns:` URLs handed to clients.
+    pub urls: Vec<String>,
+    /// Shared secret; must equal coturn's `static-auth-secret`.
+    pub secret: Secret,
+    /// Credential lifetime in seconds (default 43200 = 12 h, minimum 60).
+    /// Must cover the longest meeting: clients only get new credentials
+    /// when they rejoin.
+    pub ttl_secs: u64,
 }
 
 fn default_true() -> bool {
@@ -222,6 +260,8 @@ pub struct MediaConfig {
     /// With an empty `listen`, move the media socket when the machine's
     /// primary address changes (new Wi-Fi). Default `true`.
     pub follow_primary: bool,
+    /// Per-join TURN credentials, when configured.
+    pub turn: Option<TurnConfig>,
 }
 
 /// Fully validated server configuration.
@@ -318,6 +358,10 @@ pub fn parse(
         rooms.max_video_subscriptions >= 1,
         "rooms.max_video_subscriptions must be at least 1"
     );
+    anyhow::ensure!(
+        (1..=8).contains(&rooms.max_forwarded_audio),
+        "rooms.max_forwarded_audio must be between 1 and 8"
+    );
 
     let mut listen = file.media.listen;
     if listen.is_empty() {
@@ -327,6 +371,39 @@ pub fn parse(
         !listen.is_empty(),
         "no media address could be determined; set media.listen"
     );
+
+    let turn = match file.media.turn {
+        None => None,
+        Some(t) => {
+            anyhow::ensure!(!t.urls.is_empty(), "media.turn.urls must not be empty");
+            for url in &t.urls {
+                anyhow::ensure!(
+                    url.starts_with("turn:") || url.starts_with("turns:"),
+                    "media.turn.urls entries must start with turn: or turns:"
+                );
+            }
+            anyhow::ensure!(t.ttl_secs >= 60, "media.turn.ttl_secs must be at least 60");
+            // A secret read from a file into the environment often keeps its
+            // trailing newline, which would silently break every TURN login.
+            let trimmed_env = |name: &str| env(name).map(|v| v.trim().to_owned());
+            let secret = resolve_secret(
+                "media.turn.secret",
+                t.secret_env.as_deref(),
+                t.secret.as_deref(),
+                production,
+                &trimmed_env,
+            )?;
+            anyhow::ensure!(
+                !secret.expose().is_empty(),
+                "media.turn.secret must not be empty"
+            );
+            Some(TurnConfig {
+                urls: t.urls,
+                secret,
+                ttl_secs: t.ttl_secs,
+            })
+        }
+    };
 
     Ok(Config {
         mode: file.mode,
@@ -342,6 +419,7 @@ pub fn parse(
             listen,
             ice_servers: file.media.ice_servers,
             follow_primary: file.media.follow_primary,
+            turn,
         },
     })
 }
@@ -431,6 +509,30 @@ listen = [{ bind_ip = "127.0.0.1" }]
         let config = parse(DEV, Path::new("."), &no_env).unwrap();
         assert_eq!(config.mode, Mode::Development);
         assert_eq!(config.rooms.default_max_participants, 25);
+        assert_eq!(config.rooms.max_participants_limit, 150);
+    }
+
+    #[test]
+    fn max_forwarded_audio_defaults_to_three() {
+        let config = parse(DEV, Path::new("."), &no_env).unwrap();
+        assert_eq!(config.rooms.max_forwarded_audio, 3);
+        let text = DEV.replace("[media]", "[rooms]\nmax_forwarded_audio = 8\n[media]");
+        let config = parse(&text, Path::new("."), &no_env).unwrap();
+        assert_eq!(config.rooms.max_forwarded_audio, 8);
+    }
+
+    #[test]
+    fn max_forwarded_audio_out_of_range_is_rejected() {
+        for value in [0, 9] {
+            let text = DEV.replace(
+                "[media]",
+                &format!("[rooms]\nmax_forwarded_audio = {value}\n[media]"),
+            );
+            let error = parse(&text, Path::new("."), &no_env)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("max_forwarded_audio"), "{value}: {error}");
+        }
     }
 
     #[test]
@@ -461,5 +563,55 @@ listen = [{ bind_ip = "127.0.0.1" }]
         let printed = format!("{config:?}");
         assert!(!printed.contains("dev-secret"));
         assert!(!printed.contains("dev-admin-key"));
+    }
+
+    #[test]
+    fn turn_config_is_validated() {
+        let with = |turn: &str| format!("{DEV}\n[media.turn]\n{turn}");
+        let ok = with("urls = [\"turns:t.example.com:443?transport=tcp\"]\nsecret = \"s\"");
+        let turn = parse(&ok, Path::new("."), &no_env).unwrap().media.turn;
+        let turn = turn.unwrap();
+        assert_eq!(turn.ttl_secs, 43_200);
+        assert!(!format!("{turn:?}").contains("\"s\""));
+
+        for (bad, needle) in [
+            ("urls = [\"stun:x:3478\"]\nsecret = \"s\"", "turn:"),
+            (
+                "urls = [\"turn:x\"]\nsecret = \"s\"\nttl_secs = 59",
+                "ttl_secs",
+            ),
+            ("urls = []\nsecret = \"s\"", "urls"),
+            ("urls = [\"turn:x\"]", "media.turn.secret"),
+        ] {
+            let error = parse(&with(bad), Path::new("."), &no_env)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(needle), "{bad}: {error}");
+        }
+
+        let prod = with("urls = [\"turn:x\"]\nsecret = \"s\"")
+            .replace("\"development\"", "\"production\"");
+        let error = parse(&prod, Path::new("."), &no_env)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("inline secrets"), "{error}");
+    }
+
+    #[test]
+    fn turn_secret_from_env_is_trimmed() {
+        let config = format!("{DEV}\n[media.turn]\nurls = [\"turn:x\"]\nsecret_env = \"TURN\"");
+        let env = |name: &str| (name == "TURN").then(|| "  s3cret\n".to_owned());
+        let turn = parse(&config, Path::new("."), &env)
+            .unwrap()
+            .media
+            .turn
+            .unwrap();
+        assert_eq!(turn.secret.expose(), "s3cret");
+
+        let blank = |name: &str| (name == "TURN").then(|| " \n".to_owned());
+        let error = parse(&config, Path::new("."), &blank)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("media.turn.secret"), "{error}");
     }
 }
