@@ -3,7 +3,7 @@
 
 mod common;
 
-use ecochain_rtc_server::{auth::Role, protocol::ErrorCode};
+use ecochain_rtc_server::{auth::Role, bot::Bot, protocol::ErrorCode};
 use serde_json::json;
 use std::time::Duration;
 
@@ -519,4 +519,55 @@ turn = { urls = ["turns:turn.example.com:443?transport=tcp"], secret = "turn-sha
     let expiry: u64 = username.split(':').next().unwrap().parse().unwrap();
     assert!(expiry > ecochain_rtc_server::auth::unix_now());
     assert!(!servers[1]["credential"].as_str().unwrap().is_empty());
+}
+
+/// Dropping the subscription of a track that is already gone (its publisher
+/// left or rejoined) must not reject the other changes of the request.
+#[tokio::test]
+async fn unsubscribing_a_gone_track_does_not_block_other_changes() {
+    let server = common::start("").await;
+    let mut options = server.bot("gone", "alice");
+    options.audio = false;
+    let alice = Bot::start(options).await.unwrap();
+    let mut bob = server.signal().await;
+    let find = |p: &serde_json::Value| {
+        p["tracks"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|t| t["kind"] == "video")
+            .map(|t| t["track_id"].clone())
+    };
+    let joined = bob
+        .request(
+            "join",
+            json!({"token": server.token("gone", "bob", Role::Participant)}),
+        )
+        .await
+        .unwrap();
+    let mut track = find(&joined["participants"][0]);
+    while track.is_none() {
+        let event = bob.wait_event("participant.updated", WAIT).await.unwrap();
+        track = find(&event["data"]["participant"]);
+    }
+    let track = track.unwrap();
+    bob.request(
+        "subscription.update",
+        json!({"changes": [
+            {"track_id": "TR_gone", "subscribed": false},
+            {"track_id": track, "subscribed": true, "quality": "high"},
+        ]}),
+    )
+    .await
+    .expect("gone track is ignored");
+    // Subscribing to an unknown track is still an error.
+    let error = bob
+        .request(
+            "subscription.update",
+            json!({"changes": [{"track_id": "TR_gone", "subscribed": true}]}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Some(ErrorCode::BadRequest));
+    alice.leave().await;
 }

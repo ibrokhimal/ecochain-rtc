@@ -18,7 +18,7 @@ class RtcReconnectPolicy {
   /// Creates a policy.
   const RtcReconnectPolicy({
     this.initialDelay = const Duration(milliseconds: 500),
-    this.maxDelay = const Duration(seconds: 8),
+    this.maxDelay = const Duration(seconds: 2),
     this.giveUpAfter = const Duration(seconds: 60),
   });
 
