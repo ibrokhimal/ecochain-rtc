@@ -1,0 +1,21 @@
+name: ecochain-rtc
+services:
+  rtc:
+    image: ecochain-rtc:latest
+    restart: unless-stopped
+    # Host network: media sees the real address, and UFW rules still apply.
+    # The deploy user, so the 0600 TLS key is readable.
+    user: "1001:1001"
+    network_mode: host
+    env_file: .env
+    volumes:
+      - ./production.toml:/etc/ecochain-rtc/production.toml:ro
+      - ./tls:/etc/ecochain-rtc/tls:ro
+    cpus: 2
+    mem_limit: 2g
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }

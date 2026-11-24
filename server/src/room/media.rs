@@ -608,6 +608,14 @@ impl Room {
                 .flat_map(|(_, p)| p.tracks.iter())
                 .find(|t| t.id == change.track_id)
             else {
+                // The publisher may have left or rejoined while the request
+                // was on its way; there is nothing left to stop. Rejecting
+                // it would also reject the other changes.
+                if !change.subscribed {
+                    video.remove(&change.track_id);
+                    muted_audio.remove(&change.track_id);
+                    continue;
+                }
                 return Err(ProtocolError::new(
                     ErrorCode::BadRequest,
                     format!("unknown track {}", change.track_id),

@@ -543,10 +543,20 @@ class RtcSession extends ChangeNotifier {
   // Join, resume, reconnect
   // ---------------------------------------------------------------------
 
+  static const _maxHeartbeat = Duration(seconds: 2);
+  static const _maxConnectTime = Duration(seconds: 4);
+
   /// Opens a socket and joins (or resumes) the room.
   Future<void> _join(int generation) async {
     final options = _options!;
-    final signal = await SignalClient.connect(options.url, options.requestTimeout);
+    // An attempt started while offline must not hang long after the network
+    // is back.
+    final timeout = options.requestTimeout;
+    final signal = await SignalClient.connect(
+      options.url,
+      timeout,
+      connectTimeout: timeout < _maxConnectTime ? timeout : _maxConnectTime,
+    );
     if (!_alive(generation)) {
       await signal.close();
       return;
@@ -615,6 +625,7 @@ class RtcSession extends ChangeNotifier {
       // New server session: both peers start from scratch.
       await _closeSubscriber();
       _requestedVideos = {};
+      _subscriptionFailures = 0;
       try {
         await _media.run(() => _rebuildPublisher(generation));
       } on RtcException {
@@ -627,8 +638,12 @@ class RtcSession extends ChangeNotifier {
       }
     }
 
-    final heartbeat = Duration(milliseconds: (data['heartbeat_interval_ms'] as num?)?.toInt() ?? 5000);
-    signal.startHeartbeat(heartbeat, heartbeat * 3);
+    // The server's interval is the slowest allowed. A dead socket blocks ICE
+    // restarts, so others see frozen video until it is noticed; resuming is
+    // cheap and does not touch media that still flows.
+    final requested = Duration(milliseconds: (data['heartbeat_interval_ms'] as num?)?.toInt() ?? 5000);
+    final heartbeat = requested < _maxHeartbeat ? requested : _maxHeartbeat;
+    signal.startHeartbeat(heartbeat, heartbeat * 2);
 
     joined = true;
     for (final event in early) {
@@ -969,7 +984,9 @@ class RtcSession extends ChangeNotifier {
         state == RTCIceConnectionState.RTCIceConnectionStateDisconnected) {
       // "disconnected" often heals by itself within a second or two
       // (short radio stalls); give it a moment before restarting ICE.
-      _scheduleIceCheck(generation, const Duration(seconds: 2));
+      // "failed" never heals without a restart.
+      final failed = state == RTCIceConnectionState.RTCIceConnectionStateFailed;
+      _scheduleIceCheck(generation, failed ? Duration.zero : const Duration(seconds: 2));
     }
   }
 
@@ -1011,11 +1028,14 @@ class RtcSession extends ChangeNotifier {
   // Video subscriptions
   // ---------------------------------------------------------------------
 
-  void _scheduleSubscriptions() {
+  static const _maxSubscriptionRetries = 5;
+  int _subscriptionFailures = 0;
+
+  // Debounced: scrolling a gallery or a burst of join events should cause
+  // one update, not dozens.
+  void _scheduleSubscriptions([Duration delay = const Duration(milliseconds: 150)]) {
     _subscriptionTimer?.cancel();
-    // Debounced: scrolling a gallery or a burst of join events should cause
-    // one update, not dozens.
-    _subscriptionTimer = Timer(const Duration(milliseconds: 150), () => unawaited(_updateSubscriptions(_generation)));
+    _subscriptionTimer = Timer(delay, () => unawaited(_updateSubscriptions(_generation)));
   }
 
   Future<void> _updateSubscriptions(int generation) async {
@@ -1030,21 +1050,37 @@ class RtcSession extends ChangeNotifier {
       maxVideos: maxVideoSubscriptions,
     );
     final wanted = {for (final r in requests) r.trackId: r.quality};
+    // The server forgets subscriptions of unpublished tracks by itself, and
+    // rejects a whole update that names a track it no longer knows.
+    final published = {
+      for (final p in remote)
+        for (final t in p.tracks) t.id,
+    };
     final changes = <Map<String, dynamic>>[
       for (final id in _requestedVideos.keys)
-        if (!wanted.containsKey(id)) {'track_id': id, 'subscribed': false},
+        if (!wanted.containsKey(id) && published.contains(id)) {'track_id': id, 'subscribed': false},
       for (final entry in wanted.entries)
         if (_requestedVideos[entry.key] != entry.value)
           {'track_id': entry.key, 'subscribed': true, 'quality': entry.value.name},
     ];
-    if (changes.isEmpty) return;
+    if (changes.isEmpty) {
+      _requestedVideos = wanted;
+      return;
+    }
     final previous = _requestedVideos;
     _requestedVideos = wanted;
     try {
       await signal.request('subscription.update', {'changes': changes});
+      _subscriptionFailures = 0;
     } on RtcException {
-      // Retry from scratch on the next layout or participant change.
-      if (_alive(generation)) _requestedVideos = previous;
+      if (!_alive(generation)) return;
+      _requestedVideos = previous;
+      // For example a track vanished while the request was on its way. The
+      // event that told us may already have been handled, so do not wait
+      // for another one. Bounded: a permanent rejection must not loop.
+      if (++_subscriptionFailures <= _maxSubscriptionRetries) {
+        _scheduleSubscriptions(const Duration(seconds: 1));
+      }
     }
   }
 

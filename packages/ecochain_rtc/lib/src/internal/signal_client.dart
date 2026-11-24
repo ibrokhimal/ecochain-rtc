@@ -79,11 +79,11 @@ class SignalClient {
   /// Opens a socket to [url].
   ///
   /// Throws [RtcException] with [RtcErrorCode.connectionLost] if the socket
-  /// cannot be opened within [timeout].
-  static Future<SignalClient> connect(Uri url, Duration timeout) async {
+  /// cannot be opened within [connectTimeout] (default: [timeout]).
+  static Future<SignalClient> connect(Uri url, Duration timeout, {Duration? connectTimeout}) async {
     final channel = WebSocketChannel.connect(url);
     try {
-      await channel.ready.timeout(timeout);
+      await channel.ready.timeout(connectTimeout ?? timeout);
     } catch (e) {
       unawaited(channel.sink.close().catchError((_) {}));
       throw RtcException(RtcErrorCode.connectionLost, 'cannot open signaling socket: ${e.runtimeType}');
