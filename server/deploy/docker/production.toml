@@ -1,0 +1,20 @@
+mode = "production"
+
+[http]
+bind = "95.111.247.231:7443"
+tls_cert = "/etc/ecochain-rtc/tls/fullchain.pem"
+tls_key = "/etc/ecochain-rtc/tls/privkey.pem"
+
+[auth]
+issuer = "ecochain"
+token_secret_env = "ECOCHAIN_RTC_TOKEN_SECRET"
+admin_key_env = "ECOCHAIN_RTC_ADMIN_KEY"
+
+[rooms]
+auto_create = false
+default_max_participants = 25
+max_participants_limit = 25
+
+[media]
+udp_port = 7882
+listen = [{ bind_ip = "95.111.247.231" }]
