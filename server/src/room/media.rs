@@ -881,6 +881,8 @@ impl Room {
         } else if !data.contiguous {
             // Packets were lost beyond what NACK recovered; the decoder
             // needs a fresh keyframe.
+            tracing::debug!(publisher = %publisher_id, track = %track_id,
+                rid = ?data.rid, keyframe = data.is_keyframe(), "video reference continuity lost");
             self.request_keyframe(
                 &publisher_id,
                 &track_id,
@@ -935,6 +937,9 @@ impl Room {
                 writer.write(pt, data.network_time, time, data.data.clone())
             };
             let result = if out.kind == MediaKind::Video {
+                if !data.contiguous {
+                    out.video.observe_loss(data.rid);
+                }
                 out.video.forward(data.rid, data.is_keyframe(), write_frame)
             } else {
                 write_frame(false).map(|_| true)
@@ -958,7 +963,16 @@ impl Room {
                         wanted_keyframe.push(out.video.target_rid);
                     }
                 }
-                Err(e) => tracing::debug!(error = ?e, "forward write failed"),
+                Err(e) => {
+                    tracing::debug!(error = ?e, "forward write failed");
+                    if out.kind == MediaKind::Video
+                        && out.video.allocation != layers::Allocation::Paused
+                        && out.video.waiting
+                        && !wanted_keyframe.contains(&out.video.target_rid)
+                    {
+                        wanted_keyframe.push(out.video.target_rid);
+                    }
+                }
             }
         }
         self.services

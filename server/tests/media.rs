@@ -126,9 +126,17 @@ async fn room_busy_metric_grows() {
 #[tokio::test]
 async fn media_keeps_flowing_after_another_participant_leaves() {
     let server = common::start("").await;
-    let a = Bot::start(server.bot("leaver", "a")).await.unwrap();
-    let b = Bot::start(server.bot("leaver", "b")).await.unwrap();
-    let c = Bot::start(server.bot("leaver", "c")).await.unwrap();
+    // Match the SDK's default three-layer cameras. Two fixed 800 kbps
+    // subscriptions can legitimately lose admission during BWE fluctuations;
+    // this test isolates routing continuity when somebody leaves, not capacity.
+    let camera = |identity| {
+        let mut options = server.bot("leaver", identity);
+        options.simulcast = true;
+        options
+    };
+    let a = Bot::start(camera("a")).await.unwrap();
+    let b = Bot::start(camera("b")).await.unwrap();
+    let c = Bot::start(camera("c")).await.unwrap();
     let flowing = |s: &ecochain_rtc_server::bot::BotStats| {
         s.audio_frames_by_participant.len() == 2 && s.audio_frames > 50
     };

@@ -12,6 +12,69 @@ use crate::{
 use std::{path::Path, sync::Arc};
 use str0m::media::{MediaKind, Mid, Rid};
 
+#[tokio::test]
+async fn first_video_after_unrecovered_publisher_loss_is_a_keyframe() {
+    use crate::bot::Bot;
+    let fixture = fixture().await;
+    let server = crate::start((*fixture.services.config).clone())
+        .await
+        .unwrap();
+    let publisher = Bot::start(bot_options(&server, "publisher", true, true))
+        .await
+        .unwrap();
+    let receiver = Bot::start(bot_options(&server, "receiver", false, false))
+        .await
+        .unwrap();
+    control(
+        &server,
+        &receiver.stats().participant_id.unwrap(),
+        Some(Some(2500)),
+    )
+    .await;
+    assert!(
+        receiver
+            .wait_for(Duration::from_secs(8), |s| s.video_frames > 20)
+            .await
+    );
+    let pli_before = publisher.stats().keyframe_requests;
+    // Hold until explicitly released: a scheduler delay must not move the
+    // baseline sample past the first recovery frame.
+    publisher.outage(Duration::from_secs(3600));
+    assert!(
+        publisher
+            .wait_for(Duration::from_secs(2), |s| s.outage_active)
+            .await
+    );
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let before = receiver.stats().video_frames;
+    publisher.outage(Duration::ZERO);
+    assert!(
+        receiver
+            .wait_for(Duration::from_secs(6), |s| s.video_frames > before)
+            .await,
+        "{:?}",
+        receiver.stats()
+    );
+    let received = receiver.stats();
+    let first = received
+        .video_frame_events
+        .iter()
+        .find(|(ordinal, _)| *ordinal > before)
+        .unwrap();
+    assert!(
+        first.1,
+        "first post-loss frame {first:?} was dependent on missing video"
+    );
+    assert!(
+        publisher
+            .wait_for(Duration::from_secs(2), |s| s.keyframe_requests > pli_before)
+            .await
+    );
+    receiver.leave().await;
+    publisher.leave().await;
+    server.task.abort();
+}
+
 async fn fixture() -> Room {
     crate::install_crypto();
     let config = Arc::new(

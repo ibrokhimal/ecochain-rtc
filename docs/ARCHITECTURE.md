@@ -94,6 +94,15 @@ beradi, ammo tayyor video uchun doimiy ravishda butun sig‘imni to‘ldirmaydi.
 
 ### Paket yo‘qolishi
 
+Publisher’dagi reference continuity uzilsa, server faqat PLI so‘rash bilan
+cheklanmaydi: yo‘qotilgan RID ishlatilayotgan videolar keyframe gate’iga
+qaytariladi. Keyingi contiguous delta kadr ham yo‘qolgan kadrga bog‘liq
+bo‘lishi mumkin, shuning uchun to‘liq yangi keyframe’gacha uzatilmaydi.
+Subscriber writer butun kadrni enqueue qila olmasa ham shu qoida amal qiladi;
+server qayta paketlagani uchun bu butun-kadr yo‘qotilishi receiver’ga RTP
+sequence gap sifatida ko‘rinmaydi. Sog‘lom boshqa RID va audio davom etadi.
+
+
 * NACK/RTX — str0m publisher tomonda yo‘qolgan paketlarni so‘raydi, subscriber tomonda qayta yuboradi.
 * Keyframe so‘rovi (PLI) — kadr uzilib qolsa, yangi video obunada, qatlam almashganda; har (trek, rid) uchun alohida: so‘rovlar birlashtiriladi (bir nechta subscriber bitta PLI beradi), oddiy so‘rov 500 ms’da, shoshilinch (yangi obuna, qatlam almashishi) 250 ms’da bir martadan ko‘p emas; oyna ichidagi so‘rov oyna tugaganda yuboriladi. Spec ~150 ms deb yozgan edi; 250 ms o‘lchov va xavfsizlik ko‘rigi bo‘yicha tanlandi (bitta qatlamga ≤4 shoshilinch so‘rov/s — keyframe kuchaytirish chegaralangan). Noto‘g‘ri `rid` qatlam ro‘yxatida bo‘lmasa e’tiborga olinmaydi.
 * Opus in-band FEC — libwebrtc standarti.

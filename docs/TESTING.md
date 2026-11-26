@@ -2,6 +2,53 @@
 
 Sana: 2026-11-18 (100 kishilik bo‘lim: 2026-11-20). Mashina: Apple Silicon Mac (10 yadro), macOS 26, Rust 1.96, Flutter 3.44.1 / Dart 3.12.1.
 
+## Video reference-chain tiklanishi — 2026-11-26
+
+Qurilma kuzatuvi: remote VP8 video `720×540`, `25 FPS`, taxminan
+`1603 kbit/s` kelayotgan bo‘lsa ham mozaika paydo bo‘lishi, yuboruvchi
+kamerani o‘chirib-yoqqanda tasvir tozalanishi. Bu decoder reference-chain
+uzilishiga mos; skrinshotning o‘zi aynan qaysi paket/kadr yo‘qolganini
+isbotlamaydi.
+
+Kodda ikki tasdiqlangan yo‘l tuzatildi:
+
+- Publisher’dan `MediaData.contiguous = false` kelganda PLI so‘ralgan,
+  lekin undan keyingi dependent delta kadrlar yuborilavergan. Endi shu RID
+  ishlatilayotgan subscriber’larda gate yangi keyframe kelguncha yopiladi.
+- Subscriber writer butun delta kadrni enqueue qila olmasa, keyingi delta
+  kadrga ruxsat berilgan. Endi gate yopiladi va yangi keyframe so‘raladi.
+
+Boshqa RID yo‘qotilishi sog‘lom qatlamni to‘xtatmaydi. To‘liq keyframe,
+oldingi paketga nisbatan contiguous bo‘lmasa ham, reference-chain’ni tiklay
+oladi. Audio siyosati o‘zgarmadi.
+
+Dalillar:
+
+- `failed_delta_enqueue_invalidates_decoder_until_next_keyframe`:
+  RED (`Ok(true)` keyingi delta uchun) → GREEN (`Ok(false)`, keyin KF bilan ochiladi).
+- Haqiqiy ICE/DTLS-SRTP publisher loss sinovi: RED’da uzilishdan keyingi
+  birinchi olingan kadr `(23, false)` delta edi; GREEN’da birinchi kadr KF.
+  Yakuniy test outage boshlanganini bot’dan tasdiqlaydi va baseline olingandan
+  keyingina tarmoqni ochadi; avtomatik 800 ms tugash oynasiga bog‘lanmaydi.
+- `cargo test -- --test-threads=1`: **123 PASS / 0 FAIL**
+  (90 unit, 14 media, 6 resilience, 13 signaling).
+- `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`: PASS.
+- Test-only outage-boundary mustahkamlangandan keyin tegishli real packet-loss
+  testi yana o‘tdi; production forwarding kodi undan o‘zgarmadi.
+
+Eski leaver testi uchta fixed 800 kbit/s deb baholanadigan kamerani ochgan;
+log’da 1502 kbit/s video budjetga ikkita 800 kbit/s trek sig‘may, ulardan
+biri qonuniy pauza qilingan. Bu routing assertion’iga aloqasiz capacity
+sharti edi. Test hozir SDK kabi q/h/f simulcast ishlatadi va avvalgi barcha
+continuity assertion’larini saqlaydi; single-encoding recovery sinovlari ham
+saqlangan.
+
+Mustaqil ko‘rikda Critical/Important topilmadi. Minor: complete keyframe
+contiguous bo‘lmasa, u tiklanishga yetarli bo‘lsa ham bitta ortiqcha PLI
+so‘ralishi mumkin; mavjud throttle bilan cheklangan va optimizatsiya keyinga
+qoldirildi. Bu sinovlar photographed qurilmadagi vizual tuzalishni bevosita
+isbotlamaydi: yangi server versiyasi deploy qilingach qayta qurilma testi kerak.
+
 ## Adaptiv simulcast tekshiruvi — 2026-11-26
 
 Yangi tekshiruvlar `server/src/sfu/{layers,adaptation}.rs`,

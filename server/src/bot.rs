@@ -228,6 +228,12 @@ pub struct BotStats {
     pub video_frames: u64,
     /// Video keyframes received.
     pub video_keyframes: u64,
+    /// Recent video frame ordinals and keyframe flags for loss-recovery tests.
+    #[cfg(test)]
+    pub video_frame_events: VecDeque<(u64, bool)>,
+    /// Acknowledges that the test bot is actually dropping network packets.
+    #[cfg(test)]
+    pub outage_active: bool,
     /// Media bytes received.
     pub bytes: u64,
     /// When the last audio frame arrived.
@@ -599,6 +605,10 @@ impl Runner {
             let in_outage = self
                 .outage_until
                 .is_some_and(|until| Instant::now() < until);
+            #[cfg(test)]
+            {
+                self.stats.lock().expect("stats").outage_active = in_outage;
+            }
             if !in_outage && self.outage_until.take().is_some() {
                 self.recover_after_outage().await?;
             }
@@ -730,6 +740,16 @@ impl Runner {
                             }
                         } else {
                             stats.video_frames += 1;
+                            #[cfg(test)]
+                            {
+                                let ordinal = stats.video_frames;
+                                stats
+                                    .video_frame_events
+                                    .push_back((ordinal, data.is_keyframe()));
+                                if stats.video_frame_events.len() > 128 {
+                                    stats.video_frame_events.pop_front();
+                                }
+                            }
                             stats.last_video = Some(now);
                             if data.is_keyframe() {
                                 stats.video_keyframes += 1;

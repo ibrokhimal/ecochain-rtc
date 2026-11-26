@@ -27,6 +27,15 @@ impl Default for VideoGate {
 }
 
 impl VideoGate {
+    /// A lost reference invalidates only receivers using that encoding.
+    /// Later contiguous deltas can still depend on the missing frame.
+    pub fn observe_loss(&mut self, rid: Option<Rid>) {
+        if self.forwarded && self.current_rid == rid {
+            self.waiting = true;
+            self.allow_old = false;
+        }
+    }
+
     /// Return whether a new selected encoding needs a keyframe request.
     pub fn configure(&mut self, allocation: Allocation, target_rid: Option<Rid>) -> bool {
         if self.allocation == allocation && self.target_rid == target_rid {
@@ -53,7 +62,12 @@ impl VideoGate {
         let Some(rebase) = staged.accept(rid, keyframe) else {
             return Ok(false);
         };
-        write(rebase)?;
+        if let Err(error) = write(rebase) {
+            // The output RTP sequence will not expose a rejected whole frame
+            // to the receiver. Do not keep sending its dependent deltas.
+            self.observe_loss(rid);
+            return Err(error);
+        }
         *self = staged;
         Ok(true)
     }
@@ -175,6 +189,56 @@ mod tests {
         assert_eq!(gate.forward(h, false, |_| Ok::<(), &str>(())), Ok(false));
         assert_eq!(gate.forward(h, true, |_| Ok::<(), &str>(())), Ok(true));
         assert_eq!(gate.forward(h, false, |_| Ok::<(), &str>(())), Ok(true));
+    }
+
+    #[test]
+    fn failed_delta_enqueue_invalidates_decoder_until_next_keyframe() {
+        let q = Some(Rid::from("q"));
+        let mut gate = VideoGate::default();
+        gate.configure(Layer(0), q);
+        assert_eq!(gate.forward(q, true, |_| Ok::<(), &str>(())), Ok(true));
+        assert_eq!(
+            gate.forward(q, false, |_| Err::<(), _>("queue full")),
+            Err("queue full")
+        );
+        assert_eq!(gate.forward(q, false, |_| Ok::<(), &str>(())), Ok(false));
+        assert_eq!(gate.forward(q, true, |_| Ok::<(), &str>(())), Ok(true));
+    }
+
+    #[test]
+    fn upstream_loss_blocks_dependent_frames_for_named_and_single_encodings() {
+        for rid in [Some(Rid::from("q")), None] {
+            let mut gate = VideoGate::default();
+            gate.configure(Layer(0), rid);
+            assert_eq!(gate.forward(rid, true, |_| Ok::<(), &str>(())), Ok(true));
+            gate.observe_loss(rid);
+            assert_eq!(gate.forward(rid, false, |_| Ok::<(), &str>(())), Ok(false));
+            assert_eq!(gate.forward(rid, false, |_| Ok::<(), &str>(())), Ok(false));
+            assert_eq!(
+                gate.forward(rid, true, |rebase| {
+                    assert!(rebase);
+                    Ok::<(), &str>(())
+                }),
+                Ok(true)
+            );
+            assert_eq!(gate.forward(rid, false, |_| Ok::<(), &str>(())), Ok(true));
+        }
+    }
+
+    #[test]
+    fn loss_only_invalidates_the_encoding_that_was_actually_forwarded() {
+        let q = Some(Rid::from("q"));
+        let f = Some(Rid::from("f"));
+        let mut gate = VideoGate::default();
+        gate.configure(Layer(0), q);
+        gate.forward(q, true, |_| Ok::<(), &str>(())).unwrap();
+        gate.configure(Layer(2), f);
+        gate.observe_loss(f);
+        assert_eq!(gate.forward(q, false, |_| Ok::<(), &str>(())), Ok(true));
+        gate.observe_loss(q);
+        assert_eq!(gate.forward(q, false, |_| Ok::<(), &str>(())), Ok(false));
+        assert_eq!(gate.forward(f, false, |_| Ok::<(), &str>(())), Ok(false));
+        assert_eq!(gate.forward(f, true, |_| Ok::<(), &str>(())), Ok(true));
     }
 
     #[test]
