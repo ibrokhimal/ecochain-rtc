@@ -1,9 +1,11 @@
 import 'dart:async';
 import 'dart:ui' show ImageFilter;
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/widgets.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 
+import 'internal/video_debug_overlay.dart';
 import 'participant.dart';
 
 /// Shows a video [RtcTrack] (local or remote).
@@ -17,6 +19,9 @@ import 'participant.dart';
 /// space left around it is filled with a blurred copy of the same video.
 ///
 /// Shows [placeholder] while the track is muted or no frame has arrived.
+///
+/// Debug builds show the selected remote video's codec, dimensions, decode
+/// rate and receive bitrate above it. Local previews are labelled `LOCAL`.
 ///
 /// ```dart
 /// RtcVideoView(
@@ -147,6 +152,8 @@ class _RtcVideoViewState extends State<RtcVideoView> {
         if (visible && !widget.cover) _blurredFill(),
         if (visible) _video(cover: widget.cover),
         if (!visible || !_hasFrame) widget.placeholder,
+        if (kDebugMode && track != null && track.isVideo && !track.muted)
+          Positioned(top: 6, left: 6, right: 6, child: VideoDebugOverlay(track: track)),
       ],
     );
   }

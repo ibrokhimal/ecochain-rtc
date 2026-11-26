@@ -193,6 +193,7 @@ class RtcSession extends ChangeNotifier {
       for (final entry in _localTracks.entries)
         RtcTrack(
           id: 'local-${entry.key.wireName}',
+          isLocal: true,
           source: entry.key,
           muted: false,
           simulcast: entry.key == RtcTrackSource.camera && (_options?.simulcast ?? false),
@@ -1214,7 +1215,18 @@ class RtcSession extends ChangeNotifier {
       simulcast: t['simulcast'] == true,
       mediaTrack: media?.track,
       renderStream: media?.stream,
+      readStats: kDebugMode && media != null && t['kind'] == 'video'
+          ? () => _getRemoteTrackStats(id, media.track)
+          : null,
     );
+  }
+
+  Future<List<StatsReport>> _getRemoteTrackStats(String id, MediaStreamTrack track) async {
+    final pc = _subscriber;
+    if (pc == null || _remoteMedia[id]?.track != track) return const [];
+    final reports = await pc.getStats(track);
+    if (pc != _subscriber || _remoteMedia[id]?.track != track) return const [];
+    return reports;
   }
 
   SignalClient _requireSignal() {

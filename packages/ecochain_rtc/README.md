@@ -74,6 +74,21 @@ ListenableBuilder(
 );
 ```
 
+### Video debug statistikasi
+
+`flutter run --debug` bilan `RtcVideoView` har remote video ustida codec,
+haqiqiy frame o‘lchami, FPS va qabul qilinayotgan video bitrate’ini chiqaradi:
+
+```text
+RX • VP8 • 640×360
+25 FPS • 480 kbit/s
+```
+
+Ko‘rsatkichlar bir soniyada yangilanadi; FPS va bitrate counter farqidan
+hisoblanadi. Birinchi o‘lchov yoki platforma bermagan qiymat `—` bo‘ladi.
+Lokal preview `LOCAL` deb belgilanadi. Polling faqat debug build’da, tegishli
+tile ochiq va muted bo‘lmaganda ishlaydi; tile yopilganda to‘xtaydi.
+
 ### Qurilmalar
 
 ```dart

@@ -52,6 +52,8 @@ class RtcTrack {
     required this.source,
     required this.muted,
     required this.simulcast,
+    this.isLocal = false,
+    this.readStats,
     this.mediaTrack,
     this.renderStream,
   });
@@ -68,6 +70,13 @@ class RtcTrack {
 
   /// Whether the publisher sends simulcast layers.
   final bool simulcast;
+
+  /// Whether this track is a local preview rather than received video.
+  final bool isLocal;
+
+  /// WebRTC stats selected for this track, available for debug diagnostics.
+  /// The view polls this only in debug builds and while its tile is mounted.
+  final Future<List<StatsReport>> Function()? readStats;
 
   /// The underlying WebRTC track, once media is available.
   final MediaStreamTrack? mediaTrack;
