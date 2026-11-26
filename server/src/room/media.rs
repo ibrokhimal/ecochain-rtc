@@ -917,22 +917,7 @@ impl Room {
                 continue;
             };
 
-            let switched = if out.kind == MediaKind::Video {
-                let Some(switched) = out.video.accept(data.rid, data.is_keyframe()) else {
-                    if out.video.allocation != layers::Allocation::Paused
-                        && out.video.waiting
-                        && data.rid == out.video.target_rid
-                        && !wanted_keyframe.contains(&out.video.target_rid)
-                    {
-                        wanted_keyframe.push(out.video.target_rid);
-                    }
-                    continue;
-                };
-                switched
-            } else {
-                false
-            };
-            let time = out.timeline.map(data.time, data.network_time, switched);
+            let mut timeline = out.timeline.clone();
             let Some(mut writer) = sub.peer.rtc.writer(mid) else {
                 continue;
             };
@@ -945,14 +930,33 @@ impl Room {
             if let Some(orientation) = orientation {
                 writer = writer.video_orientation(orientation);
             }
-            match writer.write(pt, data.network_time, time, data.data.clone()) {
-                Ok(()) => {
+            let write_frame = |switched| {
+                let time = timeline.map(data.time, data.network_time, switched);
+                writer.write(pt, data.network_time, time, data.data.clone())
+            };
+            let result = if out.kind == MediaKind::Video {
+                out.video.forward(data.rid, data.is_keyframe(), write_frame)
+            } else {
+                write_frame(false).map(|_| true)
+            };
+            match result {
+                Ok(true) => {
+                    out.timeline = timeline;
                     #[cfg(test)]
                     if out.kind == MediaKind::Video {
                         out.frames_written += 1;
                     }
                     written += 1;
                     sub.peer.wake(now);
+                }
+                Ok(false) => {
+                    if out.video.allocation != layers::Allocation::Paused
+                        && out.video.waiting
+                        && data.rid == out.video.target_rid
+                        && !wanted_keyframe.contains(&out.video.target_rid)
+                    {
+                        wanted_keyframe.push(out.video.target_rid);
+                    }
                 }
                 Err(e) => tracing::debug!(error = ?e, "forward write failed"),
             }
@@ -1124,7 +1128,11 @@ impl Room {
             .out
             .iter()
             .enumerate()
-            .filter(|(_, o)| o.kind == MediaKind::Video && o.state.is_wanted())
+            .filter(|(_, o)| {
+                o.kind == MediaKind::Video
+                    && o.state.is_wanted()
+                    && participant.video_subscriptions.contains_key(&o.track_id)
+            })
             .filter(|(_, o)| tracks.get(&o.track_id).is_some_and(|(_, muted)| !muted))
             .map(|(i, _)| i)
             .collect();
@@ -1158,6 +1166,10 @@ impl Room {
             .iter()
             .map(|(_, d)| d.cost_kbps(layers::Allocation::Layer(d.requested_layer())))
             .sum();
+        let needs_recovery = requests.iter().enumerate().any(|(slot, (_, demand))| {
+            chosen[slot] != layers::Allocation::Layer(demand.requested_layer())
+                || sub.out[videos[slot]].video.waiting
+        });
         drop(requests);
         let selected: HashMap<_, _> = videos.into_iter().zip(chosen).collect();
         let mut changed = Vec::new();
@@ -1194,10 +1206,14 @@ impl Room {
         // str0m caps padding at its live estimate and suppresses it during overuse.
         let audio = (microphones.min(audio_limit) + screen_audio) as u64 * 64;
         let desired = (desired_video * 120 + audio * 100).div_ceil(85) + 100;
-        sub.peer
-            .rtc
-            .bwe()
-            .set_bitrate(Bitrate::kbps(desired), Bitrate::kbps(desired));
+        sub.peer.rtc.bwe().set_bitrate(
+            if needs_recovery {
+                Bitrate::kbps(desired)
+            } else {
+                Bitrate::ZERO
+            },
+            Bitrate::kbps(desired),
+        );
         sub.peer.wake(now);
         for (publisher_id, track_id, rid) in changed {
             self.request_keyframe(

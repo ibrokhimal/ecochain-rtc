@@ -1,6 +1,6 @@
 # Adaptive Simulcast Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Har bir subscriber internetiga mos video sifatini tanlash, audio
 uchun joy qoldirish va sig‘magan videolarni xavfsiz pauza/qayta tiklash.
@@ -46,6 +46,8 @@ forwarding keyframe gate ajratiladi. Yangi majburiy signaling API bo‘lmaydi.
 - `server/src/sfu/mod.rs`: yangi modulni e’lon qilish.
 - `server/src/sfu/peer.rs`: boshlang‘ich BWE limitini umumiy konstanta bilan moslash.
 - `server/src/room/participant.rs`: subscriber adaptation va video gate holati.
+- `server/src/room/video.rs`: staged keyframe forwarding gate va decoder holati.
+- `server/src/bot/test_transport.rs` (`cfg(test)`): SRTP bottleneck relay va wire hisoblagich.
 - `server/src/room/media.rs`: audio/speaker konteksti, BWE reaction, forwarding.
 - `server/src/room/adaptation_tests.rs` (yangi, cfg(test)): real SFU test harness.
 - `server/src/bot.rs`: qabul qilingan qatlamni ajratishga yetadigan diagnostika.
@@ -68,24 +70,24 @@ forwarding keyframe gate ajratiladi. Yangi majburiy signaling API bo‘lmaydi.
   screen_audio_count: usize, max_forwarded_audio: usize) -> u64`.
 - `INITIAL_SUBSCRIBER_KBPS: u64 = 800`, peer va budjet hisobida bir xil.
 
-- [ ] Failing tests yozish: `video_budget(None, 1, 0, 3) == 616`,
+- [x] Failing tests yozish: `video_budget(None, 1, 0, 3) == 616`,
   `video_budget(Some(0), 1, 0, 3) == 0`,
   `video_budget(Some(1000), 8, 1, 3) == 594`.
-- [ ] Allocator testlari: 3 ta high kamera va 300 kbit/s budjet =>
+- [x] Allocator testlari: 3 ta high kamera va 300 kbit/s budjet =>
   `[Layer(0), Layer(0), Paused]`; bitta high kamera va 150/500/1500 budjet =>
   mos ravishda Layer(0)/Layer(1)/Layer(2); low talab hech qachon Layer(1) olmaydi.
-- [ ] Priority va single encoding testlari: screen/high/speaker/oddiy tartibi;
+- [x] Priority va single encoding testlari: screen/high/speaker/oddiy tartibi;
   1500 kbit/s ekran sig‘masa 150 kbit/s kamera yuborilishi;
   800 kbit/s single kamera 799 da pauza bo‘lishi.
-- [ ] Chegara testlari: bo‘sh ro‘yxat, 0..=3 qatlam, katta u64 budjet,
+- [x] Chegara testlari: bo‘sh ro‘yxat, 0..=3 qatlam, katta u64 budjet,
   yig‘indi xarajat har doim budjetdan oshmasligi.
-- [ ] `cargo test --lib sfu::` bilan yangi testlar avval yiqilishini ko‘rish.
-- [ ] Ikki bosqichli (bazaviy joy, keyin upgrade) barqaror allocator va
+- [x] `cargo test --lib sfu::` bilan yangi testlar avval yiqilishini ko‘rish.
+- [x] Ikki bosqichli (bazaviy joy, keyin upgrade) barqaror allocator va
   overflow’siz zaxira hisoblashni yozish; Timeline xatti-harakatini saqlash.
   Interface migratsiyasi sabab media.rs call site’ini minimal moslash;
   to‘liq forwarding gate Task 3’da.
-- [ ] `cargo test --lib sfu::` natijasi PASS bo‘lishi.
-- [ ] Commit: `feat: allocate video within subscriber bandwidth budget`.
+- [x] `cargo test --lib sfu::` natijasi PASS bo‘lishi.
+- [x] Commit: `feat: allocate video within subscriber bandwidth budget`.
 
 ### Task 2: Barqaror upgrade va tez downgrade
 
@@ -97,21 +99,21 @@ forwarding keyframe gate ajratiladi. Yangi majburiy signaling API bo‘lmaydi.
 requests: &[(&str, VideoDemand)], budget_kbps: u64, now: Instant)
 -> Vec<Allocation>`. Requests’dagi str — xona ichida yagona track ID.
 
-- [ ] Fake vaqtli failing test: amaldagi qatlamdan pastga o‘tish shu call’da;
+- [x] Fake vaqtli failing test: amaldagi qatlamdan pastga o‘tish shu call’da;
   kerakli yangi taqsimot narxi 500 bo‘lsa 599 budjetda upgrade yo‘q,
   600 budjetda 1999 ms’da yo‘q, 2000 ms’da upgrade bor.
-- [ ] Past baho yoki kerakli taqsimot o‘zgarsa timer reset bo‘lishi;
+- [x] Past baho yoki kerakli taqsimot o‘zgarsa timer reset bo‘lishi;
   pause’dan qaytish ham 2 soniya kutishi; subscription olib tashlanishi,
   kamaygan sifat va nol budjet darhol bajarilishini sinash.
-- [ ] Ro‘yxat tartibi o‘zgarsa holat track ID bilan mos kelishini va yangi
+- [x] Ro‘yxat tartibi o‘zgarsa holat track ID bilan mos kelishini va yangi
   subscriber default holati oldingi baho/timer’ni olmasligini sinash.
-- [ ] `cargo test --lib sfu::adaptation` bilan RED natijani tasdiqlash.
-- [ ] `AdaptationState`ni implement qilish: current/pending track ID bo‘yicha;
+- [x] `cargo test --lib sfu::adaptation` bilan RED natijani tasdiqlash.
+- [x] `AdaptationState`ni implement qilish: current/pending track ID bo‘yicha;
   oldin zarur downgrade/pause’lar, keyin umumiy desired allocation uchun
   headroom va vaqt tekshiruvi. Aralash eski/yangi holat ham budjetdan oshmasin.
   Birinchi call’da budjetga mos boshlang‘ich taqsimot kutmasdan qo‘llanadi.
-- [ ] Testlar PASS, umumiy allocation cost <= budget invariant’i ham PASS.
-- [ ] Commit: `feat: stabilize subscriber video quality recovery`.
+- [x] Testlar PASS, umumiy allocation cost <= budget invariant’i ham PASS.
+- [x] Commit: `feat: stabilize subscriber video quality recovery`.
 
 ### Task 3: Room va forwarding integratsiyasi
 
@@ -124,24 +126,24 @@ requests: &[(&str, VideoDemand)], budget_kbps: u64, now: Instant)
 `allocate_layers` TWCC event, subscription/mute o‘zgarishi va housekeeping’dan
 chaqiriladi. Negotiation status bandwidth pause’dan mustaqil qoladi.
 
-- [ ] RED testlar: muted/o‘z/so‘ralmagan audio hisoblanmasligi; mikrofon
+- [x] RED testlar: muted/o‘z/so‘ralmagan audio hisoblanmasligi; mikrofon
   limiti va screen_audio; speaker priority almashishi; subscription quality
   pasayishi pending upgrade’ni bekor qilishi.
-- [ ] Forwarding gate testlari: paused video nol media write; resume’dan
+- [x] Forwarding gate testlari: paused video nol media write; resume’dan
   keyingi delta frame tashlanadi, tanlangan keyframe o‘tadi; single encoding
   va oldingi RID’ga qaytish uchun ham shunday; ovoz bloklanmaydi.
-- [ ] `cargo test --lib room::` bilan RED’ni tasdiqlash.
-- [ ] Room’da eligible audio va video context yig‘ish. Existing BWE handler’da
+- [x] `cargo test --lib room::` bilan RED’ni tasdiqlash.
+- [x] Room’da eligible audio va video context yig‘ish. Existing BWE handler’da
   yangi bahoni saqlab allocation’ni qayta hisoblash. Housekeeping fallback’ini
   saqlash; mute/unpublish yo‘llari context’ni yangilashini tekshirish.
-- [ ] Selected target/paused holatini forwarding’ga qo‘llash. Downgrade’da
+- [x] Selected target/paused holatini forwarding’ga qo‘llash. Downgrade’da
   sig‘maydigan eski qatlamni darhol to‘xtatish; upgrade’da eski qatlam faqat
   mos yangi keyframe kelguncha davom etishi. Resume uchun throttled PLI,
   Timeline continuity va pause paytida negotiation saqlanishini implement qilish.
-- [ ] Qaror o‘zgargandagina debug log: estimate, budget, track, allocation,
+- [x] Qaror o‘zgargandagina debug log: estimate, budget, track, allocation,
   pause/resume/layer-change sababi. Har frame log yozilmasin.
-- [ ] `cargo test --lib` PASS; existing Timeline/keyframe tests regressiyasiz.
-- [ ] Commit: `feat: pause and resume SFU video safely under congestion`.
+- [x] `cargo test --lib` PASS; existing Timeline/keyframe tests regressiyasiz.
+- [x] Commit: `feat: pause and resume SFU video safely under congestion`.
 
 ### Task 4: Real media va transport tekshiruvi
 
@@ -153,37 +155,37 @@ chaqiriladi. Negotiation status bandwidth pause’dan mustaqil qoladi.
 **Produces:** Production override’siz, cfg(test) ichida boshqariladigan room
 harness va har bir tekshiruvning aniq chegarasi yozilgan natijalar.
 
-- [ ] Bot synthetic video payload’da qatlam marker’ini ajratish va BotStats’da
+- [x] Bot synthetic video payload’da qatlam marker’ini ajratish va BotStats’da
   har publisher/qatlam bo‘yicha olingan frame hisobini qo‘shish; marker o‘qish
   xavfsizligini unit test bilan tekshirish. Existing testlar saqlansin.
-- [ ] Room module ichidagi cfg(test) harness haqiqiy room/peer driving’dan
+- [x] Room module ichidagi cfg(test) harness haqiqiy room/peer driving’dan
   foydalansin; test-only bahoni TWCC hodisasidan keyin allocation oldida
   qo‘llasin. Production command, HTTP, WS yoki config override qo‘shilmasin.
-- [ ] RED media test: bitta simulcast publisher va uch subscriber uchun
+- [x] RED media test: bitta simulcast publisher va uch subscriber uchun
   300/800/2500 kbit/s bahoda mos ravishda q/h/f kadrlar kelishi, begona
   qatlam kadrlariga ruxsat berilmasligi. Startup/upgrade/keyframe settle
   tugagandan keyin bounded kuzatuv oynasida tekshirish.
-- [ ] RED test: faqat bir subscriber bahosini nolga tushirish uning videosini
+- [x] RED test: faqat bir subscriber bahosini nolga tushirish uning videosini
   to‘xtatsin, audiosi va boshqa ikkisining videosi davom etsin; 2500 ga
   tiklashdan keyin 2 soniya + keyframe muddatida video qaytsin.
-- [ ] `cargo test --lib room::adaptation_tests` va `cargo test --test media`
+- [x] `cargo test --lib room::adaptation_tests` va `cargo test --test media`
   bilan RED/GREEN natijalarni olish; yangi finite startup budget sabab eski
   media testlarining kutilmalari o‘zgarsa faqat zarur joylarni moslash.
-- [ ] Shu str0m versiyasidagi BWE probing/padding API va holatini dependency
+- [x] Shu str0m versiyasidagi BWE probing/padding API va holatini dependency
   manbasidan tekshirish. Desired bitrate pauzadagi nol media rate bilan
   nolga tushmasin; pause’da ham transport signalini saqlashni tasdiqlash.
-- [ ] User-space UDP relay yoki mavjud test transportida bitta subscriber
+- [x] User-space UDP relay yoki mavjud test transportida bitta subscriber
   uchun real packet pacing/drop cheklovi bilan TWCC pasayishi va tiklanishini
   sinash; cheklangan va cheklanmagan yo‘llarni alohida o‘lchash. Faqat
   bahoni inject qilish bu qadamni bajarmaydi. Muhit imkon bermasa, aynan
   qaysi cheklov va qaysi sinov bajarilmagani TESTING.md’da qayd etilsin.
-- [ ] `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+- [x] `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
   `cargo test` muvaffaqiyatli tugasin. Faqat SDK o‘zgarsa Flutter tekshiruvlari.
-- [ ] Hujjatlarda yangi siyosat, nominal xarajat chegarasi, real TWCC va
+- [x] Hujjatlarda yangi siyosat, nominal xarajat chegarasi, real TWCC va
   synthetic media sinovlari farqini yozish; production deploy bajarilmasin.
-- [ ] `git diff --check` va to‘liq o‘zgarishlarni ko‘rib chiqish; spec
+- [x] `git diff --check` va to‘liq o‘zgarishlarni ko‘rib chiqish; spec
   mezonlari bo‘yicha bajarilgan/bajarilmagan dalillarni yakuniy javobda aytish.
-- [ ] Commit: `test: verify adaptive SFU media and recovery`.
+- [x] Commit: `test: verify adaptive SFU media and recovery`.
 
 ## Execution Review
 
@@ -193,5 +195,5 @@ test-only baho production’da mavjud emas. Transport TWCC va real dekoder
 tekshiruvi synthetic frame testlaridan alohida hisobot qilinadi.
 
 Tavsiya etilgan bajarish usuli: **Native** — vazifalar bir xil allocator,
-controller va OutTrack interfeyslariga ketma-ket bog‘langan. Rejani foydalanuvchi
-ko‘rib ma’qullagandan keyin `superpowers:executing-plans` bilan bajariladi.
+controller va OutTrack interfeyslariga ketma-ket bog‘langan. Foydalanuvchi Native usulni tanladi; `superpowers:executing-plans` bilan
+bajarildi. Yakuniy natijalar `2026-11-26-adaptive-simulcast-results.md`da.

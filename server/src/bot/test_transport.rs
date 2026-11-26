@@ -20,6 +20,7 @@ struct Routes {
 pub(crate) struct Link {
     addr: SocketAddr,
     capacity: Arc<AtomicU64>,
+    delivered: Arc<AtomicU64>,
     routes: Arc<Mutex<Routes>>,
     task: JoinHandle<()>,
 }
@@ -36,6 +37,8 @@ impl Link {
         let addr = socket.local_addr().unwrap();
         let capacity = Arc::new(AtomicU64::new(bits_per_second));
         let routes = Arc::new(Mutex::new(Routes::default()));
+        let delivered = Arc::new(AtomicU64::new(0));
+        let count = delivered.clone();
         let rate = capacity.clone();
         let peers = routes.clone();
         let task = tokio::spawn(async move {
@@ -71,7 +74,9 @@ impl Link {
                         }
                     }
                     _ = tokio::time::sleep_until(deadline.into()) => {
-                        if let Some((_, data, client)) = queue.pop_front() { let _ = socket.send_to(&data, client).await; }
+                        if let Some((_, data, client)) = queue.pop_front() {
+                            if let Ok(bytes) = socket.send_to(&data, client).await { count.fetch_add(bytes as u64, Ordering::Relaxed); }
+                        }
                     }
                 }
             }
@@ -79,11 +84,15 @@ impl Link {
         Arc::new(Self {
             addr,
             capacity,
+            delivered,
             routes,
             task,
         })
     }
 
+    pub fn delivered_bytes(&self) -> u64 {
+        self.delivered.load(Ordering::Relaxed)
+    }
     pub fn set_capacity(&self, bits_per_second: u64) {
         self.capacity.store(bits_per_second, Ordering::Relaxed);
     }

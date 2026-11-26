@@ -43,9 +43,35 @@ Yangi 5 ta room adaptation testi birgalikda o‘tdi (42.48 s); mavjud
 TWCC probing + recovery uchun 20 s gacha vaqt ajratildi; leaver testi avval
 video kelganini tekshiradi. Bu real qurilmada o‘lchangan latency SLA emas.
 
+Mustaqil ko‘rikdan keyingi regressiyalar ham qo‘shildi:
+
+- Downgrade/resume tugamay boshqa upgrade boshlansa, avval to‘xtatilgan RID
+  qayta ochilmaydi. Keyframe enqueue xatosi gate’ni ochmaydi.
+- Boshqa SDP offer pending bo‘lsa ham unsubscribe darhol video pauzasini beradi.
+- Bitta nomli RID single-encoding kamera/ekran narxida hisoblanadi.
+- Real UDP relay hisoblagichi bilan 300 kbit/s single-encoding kamera to‘liq
+  ishlaganda SRTP/padding oqimi 900 kbit/s’dan past ekanligi tekshiriladi.
+  Tuzatishdan oldin ayni regressiya 1,206,415 bit/s o‘lchab yiqilgan edi;
+  tuzatishdan keyin o‘tdi. Desired probing maqsadi o‘chirilmaydi.
+
 Socket’li testlar sandbox tashqarisida lokal UDP/TCP ruxsati bilan ishlatildi.
 Timing uchun alohida synthetic xonalar CPU’ni bo‘lishmasligi uchun to‘liq
 tekshiruv `cargo test -- --test-threads=1` bilan bajariladi.
+
+Yakuniy ko‘rik tuzatishlaridan keyingi to‘liq natija:
+
+| To‘plam | O‘tdi | Xato |
+| --- | ---: | ---: |
+| Rust unit (allocator, controller, gate va haqiqiy adaptation transporti bilan) | 86 | 0 |
+| Media | 14 | 0 |
+| Resilience (5/15 s uzilish, ICE/network/signaling) | 6 | 0 |
+| Signaling | 13 | 0 |
+| **Jami** | **119** | **0** |
+
+`cargo fmt --check` va `cargo clippy --all-targets -- -D warnings` ham o‘tdi.
+SDK mahsulot kodi o‘zgarmagani uchun Flutter testlari ushbu bosqichda qayta
+ishga tushirilmadi. To‘liq bajarish qaydi:
+[adaptive simulcast natijalari](superpowers/plans/2026-11-26-adaptive-simulcast-results.md).
 
 ## Buyruqlar
 

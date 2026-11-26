@@ -133,6 +133,11 @@ fn add_receiver(room: &mut Room) {
     let mut sub = Subscriber::new(peer);
     for publisher in &room.participants {
         for t in &publisher.tracks {
+            if t.kind == MediaKind::Video {
+                receiver
+                    .video_subscriptions
+                    .insert(t.id.clone(), Quality::Medium);
+            }
             sub.out.push(out(&publisher.id, t, Quality::Medium));
         }
     }
@@ -506,6 +511,84 @@ async fn real_single_encoding_resumes_with_keyframe_without_renegotiation() {
             .count(),
         offers,
         "bandwidth pause renegotiated the receiver"
+    );
+    receiver.leave().await;
+    publisher.leave().await;
+    server.task.abort();
+}
+
+#[tokio::test]
+async fn review_unsubscribe_pauses_video_while_another_offer_is_pending() {
+    let mut room = fixture().await;
+    let mut publisher = participant("publisher");
+    publisher
+        .tracks
+        .push(track("video", TrackSource::Camera, false));
+    room.participants.push(publisher);
+    add_receiver(&mut room);
+    let sub = room.participants[1].subscriber.as_mut().unwrap();
+    sub.estimate_kbps = Some(2500);
+    sub.out[0].state = OutState::Open(Mid::from("video"));
+    sub.out[0]
+        .video
+        .configure(Allocation::Layer(0), Some(Rid::from("q")));
+    let mut change = sub.peer.rtc.sdp_api();
+    change.add_channel("pending".into());
+    let (_, pending) = change.apply().unwrap();
+    sub.pending = Some(super::participant::PendingOffer {
+        pending,
+        revision: 1,
+        event: json!({}),
+        sent_at: Instant::now(),
+    });
+    room.update_subscriptions(
+        1,
+        &[crate::protocol::SubscriptionChange {
+            track_id: "video".into(),
+            subscribed: false,
+            quality: Quality::High,
+        }],
+    )
+    .unwrap();
+    let sub = room.participants[1].subscriber.as_ref().unwrap();
+    assert!(sub.pending.is_some());
+    assert!(matches!(sub.out[0].state, OutState::Open(_)));
+    assert_eq!(sub.out[0].video.allocation, Allocation::Paused);
+}
+
+#[tokio::test]
+async fn review_fully_active_single_video_does_not_fill_link_with_padding() {
+    use crate::bot::{test_transport::Link, Bot};
+    let fixture = fixture().await;
+    let server = crate::start((*fixture.services.config).clone())
+        .await
+        .unwrap();
+    let publisher = Bot::start(bot_options(&server, "publisher", true, false))
+        .await
+        .unwrap();
+    let link = Link::new(4_000_000).await;
+    let receiver = Bot::start_shaped(bot_options(&server, "receiver", false, false), link.clone())
+        .await
+        .unwrap();
+    control(
+        &server,
+        &receiver.stats().participant_id.unwrap(),
+        Some(Some(2500)),
+    )
+    .await;
+    assert!(
+        receiver
+            .wait_for(Duration::from_secs(8), |s| s.video_frames > 50)
+            .await
+    );
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let before = link.delivered_bytes();
+    let start = Instant::now();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let bps = ((link.delivered_bytes() - before) as f64 * 8.0) / start.elapsed().as_secs_f64();
+    assert!(
+        bps < 900_000.0,
+        "300kbps camera still filled downlink with {bps:.0}bps of SRTP/padding"
     );
     receiver.leave().await;
     publisher.leave().await;

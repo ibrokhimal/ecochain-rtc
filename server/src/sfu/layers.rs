@@ -58,7 +58,7 @@ impl VideoDemand {
     pub fn cost_kbps(&self, allocation: Allocation) -> u64 {
         match allocation {
             Allocation::Paused => 0,
-            Allocation::Layer(_) if self.layers == 0 => {
+            Allocation::Layer(_) if self.layers <= 1 => {
                 if self.screen {
                     1500
                 } else {
@@ -237,6 +237,22 @@ mod tests {
             allocate(&[screen, demand(Quality::Low, false)], 150),
             vec![Allocation::Paused, Allocation::Layer(0)]
         );
+    }
+
+    #[test]
+    fn review_one_named_rid_is_charged_as_a_single_encoding() {
+        let camera = VideoDemand {
+            layers: 1,
+            ..demand(Quality::High, false)
+        };
+        let screen = VideoDemand {
+            layers: 1,
+            ..demand(Quality::High, true)
+        };
+        assert_eq!(allocate(&[camera], 799), vec![Allocation::Paused]);
+        assert_eq!(allocate(&[camera], 800), vec![Allocation::Layer(0)]);
+        assert_eq!(allocate(&[screen], 1499), vec![Allocation::Paused]);
+        assert_eq!(allocate(&[screen], 1500), vec![Allocation::Layer(0)]);
     }
 
     #[test]

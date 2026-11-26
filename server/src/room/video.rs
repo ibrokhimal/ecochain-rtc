@@ -32,7 +32,8 @@ impl VideoGate {
         if self.allocation == allocation && self.target_rid == target_rid {
             return false;
         }
-        self.allow_old = matches!((self.allocation, allocation),
+        self.allow_old = (!self.waiting || self.allow_old)
+            && matches!((self.allocation, allocation),
             (Allocation::Layer(old), Allocation::Layer(new)) if new > old)
             && self.forwarded;
         self.allocation = allocation;
@@ -41,8 +42,24 @@ impl VideoGate {
         allocation != Allocation::Paused
     }
 
+    /// Commit decoder state only after the subscriber accepted the frame.
+    pub fn forward<E>(
+        &mut self,
+        rid: Option<Rid>,
+        keyframe: bool,
+        write: impl FnOnce(bool) -> Result<(), E>,
+    ) -> Result<bool, E> {
+        let mut staged = self.clone();
+        let Some(rebase) = staged.accept(rid, keyframe) else {
+            return Ok(false);
+        };
+        write(rebase)?;
+        *self = staged;
+        Ok(true)
+    }
+
     /// Some(rebase) permits a frame; None drops it without consuming RTP time.
-    pub fn accept(&mut self, rid: Option<Rid>, keyframe: bool) -> Option<bool> {
+    fn accept(&mut self, rid: Option<Rid>, keyframe: bool) -> Option<bool> {
         if self.allocation == Allocation::Paused {
             return None;
         }
@@ -109,6 +126,55 @@ mod tests {
         assert_eq!(gate.accept(q, false), None);
         assert_eq!(gate.accept(q, true), Some(true));
         assert_eq!(gate.accept(f, true), None);
+    }
+
+    #[test]
+    fn downgrade_then_upgrade_cannot_reenable_an_over_budget_old_encoding() {
+        let q = Some(Rid::from("q"));
+        let h = Some(Rid::from("h"));
+        let f = Some(Rid::from("f"));
+        let mut gate = VideoGate::default();
+        gate.configure(Layer(2), f);
+        gate.accept(f, true);
+        gate.configure(Layer(0), q);
+        gate.configure(Layer(1), h);
+        assert_eq!(gate.accept(f, false), None);
+        assert_eq!(gate.accept(h, false), None);
+        assert_eq!(gate.accept(h, true), Some(true));
+    }
+
+    #[test]
+    fn pending_resume_upgrade_cannot_reenable_old_delta_frames() {
+        let q = Some(Rid::from("q"));
+        let h = Some(Rid::from("h"));
+        let f = Some(Rid::from("f"));
+        let mut gate = VideoGate::default();
+        gate.configure(Layer(0), q);
+        gate.accept(q, true);
+        gate.configure(Paused, None);
+        gate.configure(Layer(1), h);
+        gate.configure(Layer(2), f);
+        assert_eq!(gate.accept(q, false), None);
+        assert_eq!(gate.accept(f, false), None);
+        assert_eq!(gate.accept(f, true), Some(true));
+    }
+
+    #[test]
+    fn failed_keyframe_enqueue_does_not_open_delta_gate() {
+        let q = Some(Rid::from("q"));
+        let h = Some(Rid::from("h"));
+        let mut gate = VideoGate::default();
+        gate.configure(Layer(0), q);
+        gate.accept(q, true);
+        gate.configure(Paused, None);
+        gate.configure(Layer(1), h);
+        assert_eq!(
+            gate.forward(h, true, |_| Err::<(), _>("queue full")),
+            Err("queue full")
+        );
+        assert_eq!(gate.forward(h, false, |_| Ok::<(), &str>(())), Ok(false));
+        assert_eq!(gate.forward(h, true, |_| Ok::<(), &str>(())), Ok(true));
+        assert_eq!(gate.forward(h, false, |_| Ok::<(), &str>(())), Ok(true));
     }
 
     #[test]

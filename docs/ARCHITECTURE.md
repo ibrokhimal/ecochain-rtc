@@ -55,32 +55,42 @@ TWCC hali kelmasa 800 kbit/s bilan boshlanadi; nol bahoda video yuborilmaydi.
 Audio zaxirasi har eligible remote audio trekka 64 kbit/s: mikrofonlar soni
 `max_forwarded_audio` bilan cheklanadi, ekran audiosi alohida qo‘shiladi.
 Muted, o‘z va obunadan chiqarilgan audio hisoblanmaydi. Nominal single-encoding
-kamera narxi 800, ekran 1500 kbit/s. Bu payload modeli; ayniqsa keyframe, RTX
+kamera narxi 800, ekran 1500 kbit/s (RID ro‘yxati bo‘sh yoki bitta nomli
+RID bo‘lsa ham). Bu payload modeli; ayniqsa keyframe, RTX
 va probing paytida haqiqiy wire bitrate uchun qat’iy limit emas.
 
 Avval ekran → high kamera → faol gapiruvchi → qolgan kameralar tartibida
 bazaviy qatlamlarga joy ajratiladi. Sig‘magan video SDP’ni yopmasdan pauza
 qilinadi. Keyin qolgan budjet shu ustuvorlik bilan sifatni yaxshilaydi;
-klient so‘ragan sifat yuqori chegara bo‘lib qoladi. Muted video ham pauza.
+klient so‘ragan sifat yuqori chegara bo‘lib qoladi. Muted video ham pauza. Obuna bekor qilinganda, boshqa SDP offer’iga
+javob kutilayotgan bo‘lsa ham uning paketlari darhol to‘xtaydi.
 
 Budjet kamayganda downgrade/pause darhol, o‘sishda esa yangi taqsimot
 2 soniya davomida kamida 20% qo‘shimcha video budjeti bilan sig‘gandan keyin
 qo‘llanadi. Yetarli zaxira saqlangan kichik TWCC tebranishi kutishni qayta
 boshlamaydi; zaxira yo‘qolishi yoki kerakli taqsimot o‘zgarishi qayta boshlaydi.
+Recovery taqsimoti 20% zaxira oldindan ajratilgan budjetda hisoblanadi:
+yangi bazaviy kamera boshqa trekning sig‘maydigan yuqori sifatini kutmaydi.
 Controller track ID bo‘yicha holat saqlaydi va yangi peer’da tozalanadi.
 
 Pauzadagi trekka yangi kadr yozilmaydi. Resume va encoding almashishi yangi
 keyframe orqali ochiladi (single encoding uchun ham); downgrade’da eski yuqori
 qatlam to‘xtaydi, upgrade’da eski past qatlam keyframe kelguncha davom etishi
-mumkin. RTP vaqt shkalasi `sfu/layers.rs::Timeline` orqali uzluksiz qoladi.
+mumkin. Gate va RTP vaqt holati faqat subscriber writer kadrni muvaffaqiyatli
+qabul qilgandan keyin yangilanadi; queue to‘lib keyframe yozilmasa, keyingi
+delta kadr o‘tmaydi. RTP vaqt shkalasi `sfu/layers.rs::Timeline` orqali
+uzluksiz qoladi.
 Klient pauzada oxirgi kadrni ko‘rsatishi, oldin yuborilgan RTX/bufer kadrlarini
 kechroq olishi mumkin; alohida tarmoq holati UI eventi qo‘shilmagan.
 
 Barcha video pauzada ham probing maqsadi saqlanadi: kerakli video sifati,
 20% recovery zaxirasi, audio va transport xarajatlarini hisobga oladi.
 `str0m` padding’ni joriy TWCC bahosidan oshirmaydi va overuse paytida to‘xtatadi.
-Bu bo‘sh ulanishni qayta o‘lchashga yordam beradi, ammo idle tarmoq sarfini
-oshirishi mumkin. Allocation o‘zgargandagina debug log yoziladi.
+Recovery uchun minimum padding faqat hali so‘ralgan sifatga yetmagan yoki
+keyframe kutayotgan video borligida qo‘yiladi. Barcha so‘ralgan qatlamlar
+uzatilganda minimum nolga qaytadi; desired probe maqsadi va str0m’ning
+avtomatik transport floor’i qoladi. Bu recovery vaqtida qo‘shimcha trafik
+beradi, ammo tayyor video uchun doimiy ravishda butun sig‘imni to‘ldirmaydi. Allocation o‘zgargandagina debug log yoziladi.
 
 ### Paket yo‘qolishi
 
