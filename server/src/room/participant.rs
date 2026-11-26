@@ -171,6 +171,8 @@ pub struct Subscriber {
     pub has_channel: bool,
     /// Latest TWCC estimate in kbps.
     pub estimate_kbps: Option<u64>,
+    /// Bandwidth recovery hysteresis, reset with the subscriber peer.
+    pub adaptation: crate::sfu::adaptation::AdaptationState,
 }
 
 impl Subscriber {
@@ -184,6 +186,7 @@ impl Subscriber {
             ice_restart: false,
             has_channel: false,
             estimate_kbps: None,
+            adaptation: Default::default(),
         }
     }
 
