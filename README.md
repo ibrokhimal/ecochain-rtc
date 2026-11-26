@@ -97,6 +97,15 @@ cd server && cargo run --release --bin loadtest -- --participants 25 --max-video
 
 Natijalar: [docs/TESTING.md](docs/TESTING.md).
 
+## Adaptiv video
+
+Kamera uch sifatda simulcast yuboradi. Server har qabul qiluvchining TWCC
+tezligiga qarab sifatni tanlaydi, audio uchun zaxira qoldiradi va bandwidth
+sig‘magan videolarni vaqtincha pauza qiladi. Sifat 2 soniya barqaror zaxira
+bo‘lganda qayta oshadi; pauzadan keyin video yangi keyframe bilan ochiladi.
+Buning uchun yangi klient signaling versiyasi yoki maxsus server sozlamasi
+kerak emas. Tafsilot: [tarmoqqa moslashish](docs/ARCHITECTURE.md#simulcast-va-tarmoqqa-moslashish).
+
 ## Holat
 
 Bajarildi: birinchi bosqich (server, SDK, umumiy UI, ikki ilova, ikki qurilmali haqiqiy audio-video, reconnect, tozalash, simulcast, faol gapiruvchi, ekran ulashish API’si desktop uchun).

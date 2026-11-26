@@ -134,6 +134,8 @@ pub struct OutTrack {
     pub quality: Quality,
     /// Video pause, selected encoding, and independent keyframe gate.
     pub video: super::video::VideoGate,
+    #[cfg(test)]
+    pub frames_written: u64,
     /// Keeps RTP time continuous across layer switches.
     pub timeline: Timeline,
 }

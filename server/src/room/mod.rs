@@ -56,6 +56,16 @@ pub enum JoinOutcome {
 
 /// Messages a room accepts.
 pub enum RoomCommand {
+    /// Test-only controller; absent from server binaries and wire protocol.
+    #[cfg(test)]
+    TestAdaptation {
+        /// Participant whose policy is inspected.
+        participant_id: String,
+        /// None reads; Some(Some(kbps)) overrides; Some(None) clears override.
+        estimate: Option<Option<u64>>,
+        /// Snapshot of real room state.
+        reply: oneshot::Sender<Value>,
+    },
     /// Attach a socket to a new or resumed session.
     Join {
         /// Verified token claims.
@@ -170,12 +180,16 @@ pub fn spawn(
         speakers_due: None,
         keyframes_due: None,
         ended: false,
+        #[cfg(test)]
+        test_estimates: HashMap::new(),
     };
     tokio::spawn(room.run(commands_rx, packets_rx, handle.clone()));
     handle
 }
 
 pub(crate) struct Room {
+    #[cfg(test)]
+    test_estimates: HashMap<String, u64>,
     id: String,
     max_participants: usize,
     services: RoomServices,
@@ -304,6 +318,35 @@ impl Room {
 
     fn handle_command(&mut self, command: RoomCommand) {
         match command {
+            #[cfg(test)]
+            RoomCommand::TestAdaptation {
+                participant_id,
+                estimate,
+                reply,
+            } => {
+                if let Some(estimate) = estimate {
+                    if let Some(kbps) = estimate {
+                        self.test_estimates.insert(participant_id.clone(), kbps);
+                    } else {
+                        self.test_estimates.remove(&participant_id);
+                    }
+                }
+                if let Some(index) = self
+                    .participants
+                    .iter()
+                    .position(|p| p.id == participant_id)
+                {
+                    self.allocate_layers(index);
+                    let sub = self.participants[index].subscriber.as_ref();
+                    let _ = reply.send(json!({
+                        "estimate_kbps": sub.and_then(|s| s.estimate_kbps),
+                        "video_frames_written": sub.map(|s| s.out.iter().map(|o| o.frames_written).sum::<u64>()),
+                        "allocations": sub.map(|s| s.out.iter().filter(|o| o.kind == str0m::media::MediaKind::Video).map(|o| format!("{:?}", o.video.allocation)).collect::<Vec<_>>()),
+                    }));
+                } else {
+                    let _ = reply.send(Value::Null);
+                }
+            }
             RoomCommand::Join {
                 claims,
                 request_id,

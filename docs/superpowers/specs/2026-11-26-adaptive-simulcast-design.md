@@ -1,7 +1,7 @@
 # Internet tezligiga moslashuvchi meeting videosi
 
 Sana: 2026-11-26
-Holat: foydalanuvchi arxitektura yo‘nalishini ma’qullagan; yozma dizayn ko‘rib chiqish uchun tayyor.
+Holat: foydalanuvchi yozma dizaynni ma’qullagan; Native implementatsiya davom etmoqda.
 
 ## Maqsad va kelishilgan yo‘l
 
@@ -75,7 +75,10 @@ ifodalanmaydi. Pauza SDP subscription’ni yopmaydi.
   BWE hodisasi allocation’ni ishga tushiradi, housekeeping zaxira yo‘l bo‘ladi.
 - O‘sish yoki pauzadan qaytish uchun yangi taqsimot 2 soniya uzluksiz mos
   kelishi va uning narxi uchun kamida 20 foiz qo‘shimcha video budjeti bo‘lishi
-  kerak. Past baho kelishi kutish vaqtini qayta boshlaydi.
+  kerak. Zarur 20 foizlik zaxira yetmaydigan past baho kutish vaqtini qayta boshlaydi;
+  yetarli zaxira saqlangan kichik tebranish kutishni uzaytirmaydi.
+- Recovery taqsimoti 20% zaxira oldindan ayrilgan budjetda tanlanadi;
+  sig‘adigan bazaviy video boshqa trekning sig‘maydigan yuqori sifatini kutmaydi.
 - So‘ralgan sifat kamayishi, unsubscription yoki mute darhol bajariladi.
 - Allocation kutayotgan yaxshilanishni hamda amaldagi forwarding holatini
   alohida saqlaydi. Limit kamayganda eski pending yaxshilanish bekor qilinadi.

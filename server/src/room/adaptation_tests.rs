@@ -44,6 +44,7 @@ listen = [{ bind_ip = "127.0.0.1" }]
     .unwrap();
     let (packets_tx, _) = mpsc::channel(100);
     Room {
+        test_estimates: HashMap::new(),
         id: "adaptation".into(),
         max_participants: 25,
         services: RoomServices {
@@ -116,6 +117,7 @@ fn out(publisher: &str, t: &PublishedTrack, quality: Quality) -> OutTrack {
         state: OutState::ToOpen,
         quality,
         video: Default::default(),
+        frames_written: 0,
         timeline: Default::default(),
     }
 }
@@ -207,4 +209,305 @@ async fn room_reserves_audio_and_updates_speaker_priority() {
             .allocation,
         Allocation::Paused
     );
+}
+
+async fn control(server: &crate::Server, id: &str, estimate: Option<Option<u64>>) -> Value {
+    let (reply, response) = oneshot::channel();
+    assert!(
+        server
+            .app
+            .rooms
+            .get("adaptive-media")
+            .unwrap()
+            .send(RoomCommand::TestAdaptation {
+                participant_id: id.into(),
+                estimate,
+                reply,
+            })
+            .await
+    );
+    response.await.unwrap()
+}
+
+fn bot_options(
+    server: &crate::Server,
+    id: &str,
+    publish: bool,
+    simulcast: bool,
+) -> crate::bot::BotOptions {
+    let now = crate::auth::unix_now();
+    let claims = Claims {
+        iss: "test".into(),
+        sub: id.into(),
+        room: "adaptive-media".into(),
+        name: None,
+        role: Role::Participant,
+        can_publish: true,
+        exp: now + 3600,
+        iat: now,
+        nbf: None,
+    };
+    crate::bot::BotOptions {
+        url: format!("ws://{}/v1/rtc", server.http_addr),
+        token: crate::auth::issue(&claims, &server.app.config.auth.token_secret),
+        bind_ip: "127.0.0.1".parse().unwrap(),
+        audio: publish,
+        video_kbps: publish.then_some(300),
+        simulcast,
+        max_video: 4,
+        audio_level: -25,
+        audio_muted: false,
+        high_video: usize::MAX,
+    }
+}
+
+fn layer_frames(bot: &crate::bot::Bot, publisher: &str, layer: usize) -> u64 {
+    bot.stats()
+        .video_frames_by_layer
+        .get(&(publisher.into(), layer))
+        .copied()
+        .unwrap_or(0)
+}
+
+#[tokio::test]
+async fn real_media_uses_three_receiver_budgets_and_resumes_independently() {
+    use crate::bot::Bot;
+    let fixture = fixture().await;
+    let server = crate::start((*fixture.services.config).clone())
+        .await
+        .unwrap();
+    let publisher = Bot::start(bot_options(&server, "publisher", true, true))
+        .await
+        .unwrap();
+    let publisher_id = publisher.stats().participant_id.unwrap();
+    let mut receivers = vec![];
+    for (i, budget) in [300, 800, 2500].into_iter().enumerate() {
+        let bot = Bot::start(bot_options(&server, &format!("r{i}"), false, false))
+            .await
+            .unwrap();
+        control(
+            &server,
+            &bot.stats().participant_id.unwrap(),
+            Some(Some(budget)),
+        )
+        .await;
+        receivers.push(bot);
+    }
+    for (layer, bot) in receivers.iter().enumerate() {
+        assert!(
+            bot.wait_for(Duration::from_secs(12), |s| s
+                .video_frames_by_layer
+                .get(&(publisher_id.clone(), layer))
+                .is_some_and(|n| *n > 25))
+                .await,
+            "layer {layer}: {:?}",
+            bot.stats()
+        );
+    }
+    let before: Vec<_> = receivers.iter().map(|b| b.stats()).collect();
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    for (layer, bot) in receivers.iter().enumerate() {
+        for other in 0..3 {
+            let a = before[layer]
+                .video_frames_by_layer
+                .get(&(publisher_id.clone(), other))
+                .copied()
+                .unwrap_or(0);
+            let b = layer_frames(bot, &publisher_id, other);
+            if layer == other {
+                assert!(b > a + 10);
+            } else {
+                assert_eq!(b, a, "unexpected layer {other} for receiver {layer}");
+            }
+        }
+    }
+    let id = receivers[0].stats().participant_id.unwrap();
+    control(&server, &id, Some(Some(0))).await;
+    tokio::time::sleep(Duration::from_millis(200)).await; // drain previously queued packets
+    let paused = receivers[0].stats();
+    let other_frames = [
+        receivers[1].stats().video_frames,
+        receivers[2].stats().video_frames,
+    ];
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(receivers[0].stats().video_frames, paused.video_frames);
+    assert!(receivers[0].stats().audio_frames > paused.audio_frames + 20);
+    for i in 1..3 {
+        assert!(receivers[i].stats().video_frames > other_frames[i - 1] + 10);
+    }
+    control(&server, &id, Some(Some(2500))).await;
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert_eq!(
+        receivers[0].stats().video_frames,
+        paused.video_frames,
+        "recovery bypassed hold"
+    );
+    assert!(
+        receivers[0]
+            .wait_for(Duration::from_secs(6), |s| s
+                .video_frames_by_layer
+                .get(&(publisher_id.clone(), 2))
+                .is_some_and(|n| *n > 20)
+                && s.video_keyframes > paused.video_keyframes)
+            .await,
+        "{:?}",
+        receivers[0].stats()
+    );
+    for bot in receivers {
+        bot.leave().await;
+    }
+    publisher.leave().await;
+    server.task.abort();
+}
+
+#[tokio::test]
+async fn shaped_transport_recovers_from_all_video_paused_with_real_twcc() {
+    use crate::bot::{test_transport::Link, Bot};
+    let fixture = fixture().await;
+    let server = crate::start((*fixture.services.config).clone())
+        .await
+        .unwrap();
+    let publisher = Bot::start(bot_options(&server, "publisher", true, true))
+        .await
+        .unwrap();
+    let link = Link::new(4_000_000).await;
+    let shaped = Bot::start_shaped(bot_options(&server, "shaped", false, false), link.clone())
+        .await
+        .unwrap();
+    let normal = Bot::start(bot_options(&server, "normal", false, false))
+        .await
+        .unwrap();
+    assert!(
+        shaped
+            .wait_for(Duration::from_secs(20), |s| s.video_frames > 30)
+            .await,
+        "startup: {:?}",
+        shaped.stats()
+    );
+    let id = shaped.stats().participant_id.unwrap();
+    link.set_capacity(120_000);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let state = control(&server, &id, None).await;
+        if state["estimate_kbps"].as_u64().is_some_and(|v| v < 250)
+            && state["allocations"][0] == "Paused"
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no congestion reaction: {state}; {:?}",
+            shaped.stats()
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let before = shaped.stats();
+    let forwarded_before = control(&server, &id, None).await["video_frames_written"].clone();
+    let normal_before = normal.stats().video_frames;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    // RTX and already-buffered/depacketized frames can arrive after policy pause.
+    // Assert that the real SFU stops writing new frames, not that the client
+    // discards frames already in flight before the pause.
+    assert_eq!(
+        control(&server, &id, None).await["video_frames_written"],
+        forwarded_before,
+        "SFU wrote video while paused"
+    );
+    assert!(
+        shaped.stats().audio_frames > before.audio_frames + 5,
+        "audio stopped under shaped link"
+    );
+    assert!(
+        normal.stats().video_frames > normal_before + 10,
+        "other subscriber affected"
+    );
+    link.set_capacity(4_000_000);
+    assert!(
+        shaped
+            .wait_for(Duration::from_secs(25), |s| s.video_frames
+                > before.video_frames + 25
+                && s.video_keyframes > before.video_keyframes)
+            .await,
+        "did not recover from full video pause: {:?}, state {}",
+        shaped.stats(),
+        control(&server, &id, None).await
+    );
+    let publisher_id = publisher.stats().participant_id.unwrap();
+    let high_before = before
+        .video_frames_by_layer
+        .get(&(publisher_id.clone(), 2))
+        .copied()
+        .unwrap_or(0);
+    assert!(
+        shaped
+            .wait_for(Duration::from_secs(25), |s| s
+                .video_frames_by_layer
+                .get(&(publisher_id.clone(), 2))
+                .copied()
+                .unwrap_or(0)
+                > high_before + 20)
+            .await,
+        "quality did not recover to high: {:?}, state {}",
+        shaped.stats(),
+        control(&server, &id, None).await
+    );
+    eprintln!("real TWCC recovery: {}", control(&server, &id, None).await);
+    shaped.leave().await;
+    normal.leave().await;
+    publisher.leave().await;
+    server.task.abort();
+}
+
+#[tokio::test]
+async fn real_single_encoding_resumes_with_keyframe_without_renegotiation() {
+    use crate::bot::Bot;
+    let fixture = fixture().await;
+    let server = crate::start((*fixture.services.config).clone())
+        .await
+        .unwrap();
+    let publisher = Bot::start(bot_options(&server, "publisher", true, false))
+        .await
+        .unwrap();
+    let receiver = Bot::start(bot_options(&server, "single-receiver", false, false))
+        .await
+        .unwrap();
+    let id = receiver.stats().participant_id.unwrap();
+    control(&server, &id, Some(Some(2500))).await;
+    assert!(
+        receiver
+            .wait_for(Duration::from_secs(8), |s| s.video_frames > 20)
+            .await
+    );
+    control(&server, &id, Some(Some(0))).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let before = receiver.stats();
+    let offers = before
+        .events
+        .iter()
+        .filter(|e| *e == "subscriber.offer")
+        .count();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(receiver.stats().video_frames, before.video_frames);
+    control(&server, &id, Some(Some(2500))).await;
+    assert!(
+        receiver
+            .wait_for(Duration::from_secs(6), |s| s.video_frames
+                > before.video_frames + 20
+                && s.video_keyframes > before.video_keyframes)
+            .await
+    );
+    assert_eq!(
+        receiver
+            .stats()
+            .events
+            .iter()
+            .filter(|e| *e == "subscriber.offer")
+            .count(),
+        offers,
+        "bandwidth pause renegotiated the receiver"
+    );
+    receiver.leave().await;
+    publisher.leave().await;
+    server.task.abort();
 }

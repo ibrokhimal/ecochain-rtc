@@ -740,6 +740,8 @@ impl Room {
                     state: OutState::ToOpen,
                     quality: d.quality,
                     video: Default::default(),
+                    #[cfg(test)]
+                    frames_written: 0,
                     timeline: Default::default(),
                 });
             }
@@ -945,6 +947,10 @@ impl Room {
             }
             match writer.write(pt, data.network_time, time, data.data.clone()) {
                 Ok(()) => {
+                    #[cfg(test)]
+                    if out.kind == MediaKind::Video {
+                        out.frames_written += 1;
+                    }
                     written += 1;
                     sub.peer.wake(now);
                 }
@@ -1137,12 +1143,16 @@ impl Room {
                 )
             })
             .collect();
-        let budget = crate::sfu::adaptation::video_budget(
-            sub.estimate_kbps,
-            microphones,
-            screen_audio,
-            audio_limit,
-        );
+        #[cfg(test)]
+        let estimate = self
+            .test_estimates
+            .get(&participant.id)
+            .copied()
+            .or(sub.estimate_kbps);
+        #[cfg(not(test))]
+        let estimate = sub.estimate_kbps;
+        let budget =
+            crate::sfu::adaptation::video_budget(estimate, microphones, screen_audio, audio_limit);
         let chosen = sub.adaptation.update(&requests, budget, now);
         let desired_video: u64 = requests
             .iter()

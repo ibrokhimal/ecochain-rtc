@@ -46,7 +46,41 @@ Barcha xonalar bitta UDP portni (standart 7882) ishlatadi. Notanish manzildan ke
 
 ### Simulcast va tarmoqqa moslashish
 
-Kamera 3 qatlamda yuboriladi (`q` ¼, `h` ½, `f` to‘liq; 150/500/1500 kbit/s). Har subscriber uchun server bitta qatlamni tanlaydi: so‘ralgan sifat (tile o‘lchami) va str0m TWCC bandwidth bahosi asosida. Ustuvorlik qat’iy: avval ekran ulashish, keyin `high` (mahkamlangan) va h.k.; har trek kamida eng past qatlamni oladi. Qatlam almashishi faqat keyframe’da, RTP vaqt shkalasi qayta yoziladi (`sfu/layers.rs::Timeline`).
+Kamera 3 mustaqil simulcast encoding’da yuboriladi (`q` ¼, `h` ½, `f` to‘liq;
+150/500/1500 kbit/s). Bu spatial SVC emas. Flutter publisher va signaling
+interfeysi o‘zgarmaydi; har subscriber uchun qarorni Rust SFU chiqaradi.
+
+Video budjeti: `max(0, floor(TWCC_kbps * 0.85) - audio_reserve)`.
+TWCC hali kelmasa 800 kbit/s bilan boshlanadi; nol bahoda video yuborilmaydi.
+Audio zaxirasi har eligible remote audio trekka 64 kbit/s: mikrofonlar soni
+`max_forwarded_audio` bilan cheklanadi, ekran audiosi alohida qo‘shiladi.
+Muted, o‘z va obunadan chiqarilgan audio hisoblanmaydi. Nominal single-encoding
+kamera narxi 800, ekran 1500 kbit/s. Bu payload modeli; ayniqsa keyframe, RTX
+va probing paytida haqiqiy wire bitrate uchun qat’iy limit emas.
+
+Avval ekran → high kamera → faol gapiruvchi → qolgan kameralar tartibida
+bazaviy qatlamlarga joy ajratiladi. Sig‘magan video SDP’ni yopmasdan pauza
+qilinadi. Keyin qolgan budjet shu ustuvorlik bilan sifatni yaxshilaydi;
+klient so‘ragan sifat yuqori chegara bo‘lib qoladi. Muted video ham pauza.
+
+Budjet kamayganda downgrade/pause darhol, o‘sishda esa yangi taqsimot
+2 soniya davomida kamida 20% qo‘shimcha video budjeti bilan sig‘gandan keyin
+qo‘llanadi. Yetarli zaxira saqlangan kichik TWCC tebranishi kutishni qayta
+boshlamaydi; zaxira yo‘qolishi yoki kerakli taqsimot o‘zgarishi qayta boshlaydi.
+Controller track ID bo‘yicha holat saqlaydi va yangi peer’da tozalanadi.
+
+Pauzadagi trekka yangi kadr yozilmaydi. Resume va encoding almashishi yangi
+keyframe orqali ochiladi (single encoding uchun ham); downgrade’da eski yuqori
+qatlam to‘xtaydi, upgrade’da eski past qatlam keyframe kelguncha davom etishi
+mumkin. RTP vaqt shkalasi `sfu/layers.rs::Timeline` orqali uzluksiz qoladi.
+Klient pauzada oxirgi kadrni ko‘rsatishi, oldin yuborilgan RTX/bufer kadrlarini
+kechroq olishi mumkin; alohida tarmoq holati UI eventi qo‘shilmagan.
+
+Barcha video pauzada ham probing maqsadi saqlanadi: kerakli video sifati,
+20% recovery zaxirasi, audio va transport xarajatlarini hisobga oladi.
+`str0m` padding’ni joriy TWCC bahosidan oshirmaydi va overuse paytida to‘xtatadi.
+Bu bo‘sh ulanishni qayta o‘lchashga yordam beradi, ammo idle tarmoq sarfini
+oshirishi mumkin. Allocation o‘zgargandagina debug log yoziladi.
 
 ### Paket yo‘qolishi
 

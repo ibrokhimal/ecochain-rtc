@@ -42,9 +42,6 @@ impl AdaptationState {
         let demands: Vec<_> = requests.iter().map(|(_, demand)| *demand).collect();
         let desired = allocate(&demands, budget_kbps);
         let first = self.previous_budget.is_none();
-        let fell = self
-            .previous_budget
-            .is_some_and(|previous| budget_kbps < previous);
         self.previous_budget = Some(budget_kbps);
         self.current
             .retain(|id, _| requests.iter().any(|(track, _)| *track == id));
@@ -62,16 +59,19 @@ impl AdaptationState {
                 }
             };
         }
-        let cost: u128 = demands
-            .iter()
-            .zip(&desired)
-            .map(|(d, &a)| u128::from(d.cost_kbps(a)))
-            .sum();
-        let upgrade = requests
-            .iter()
-            .zip(&desired)
-            .any(|((id, _), want)| self.current.get(*id) != Some(want));
-        if !upgrade || cost * 120 > u128::from(budget_kbps) * 100 {
+        // Reserve recovery margin before choosing layers. Allocating at the
+        // hard budget and rejecting that whole allocation can starve an affordable
+        // new base layer behind somebody else's unaffordable high-quality upgrade.
+        let recovery_budget = (u128::from(budget_kbps) * 100 / 120) as u64;
+        let desired = allocate(&demands, recovery_budget);
+        let upgrade = requests.iter().zip(&desired).any(|((id, _), want)| {
+            matches!(
+                (self.current[*id], *want),
+                (Allocation::Paused, Allocation::Layer(_))
+            ) || matches!((self.current[*id], *want),
+                (Allocation::Layer(current), Allocation::Layer(target)) if target > current)
+        });
+        if !upgrade {
             self.pending = None;
         } else {
             let mut key: Vec<_> = requests
@@ -80,11 +80,10 @@ impl AdaptationState {
                 .map(|((id, _), &a)| ((*id).to_owned(), a))
                 .collect();
             key.sort_by(|a, b| a.0.cmp(&b.0));
-            let same = !fell
-                && self
-                    .pending
-                    .as_ref()
-                    .is_some_and(|(previous, _)| *previous == key);
+            let same = self
+                .pending
+                .as_ref()
+                .is_some_and(|(previous, _)| *previous == key);
             if !same {
                 self.pending = Some((key, now));
             }
@@ -154,6 +153,33 @@ mod tests {
     }
 
     #[test]
+    fn adequate_but_wavering_capacity_does_not_starve_recovery() {
+        let t = Instant::now();
+        let req = [("a", camera())];
+        let mut c = AdaptationState::default();
+        c.update(&req, 150, t);
+        c.update(&req, 700, t);
+        c.update(&req, 690, t + Duration::from_secs(1));
+        assert_eq!(
+            c.update(&req, 680, t + Duration::from_secs(2)),
+            vec![Allocation::Layer(1)]
+        );
+    }
+
+    #[test]
+    fn new_camera_is_admitted_without_waiting_for_unaffordable_high_upgrade() {
+        let t = Instant::now();
+        let mut c = AdaptationState::default();
+        c.update(&[("a", camera())], 600, t);
+        let req = [("a", camera()), ("b", camera())];
+        c.update(&req, 1700, t);
+        assert_eq!(
+            c.update(&req, 1700, t + Duration::from_secs(2)),
+            vec![Allocation::Layer(1), Allocation::Layer(1)]
+        );
+    }
+
+    #[test]
     fn lower_budget_resets_pending_upgrade() {
         let t = Instant::now();
         let req = [("a", camera())];
@@ -161,7 +187,7 @@ mod tests {
         c.update(&req, 150, t);
         c.update(&req, 700, t);
         assert_eq!(
-            c.update(&req, 650, t + Duration::from_secs(1)),
+            c.update(&req, 590, t + Duration::from_secs(1)),
             vec![Allocation::Layer(0)]
         );
         assert_eq!(
@@ -169,7 +195,7 @@ mod tests {
             vec![Allocation::Layer(0)]
         );
         assert_eq!(
-            c.update(&req, 650, t + Duration::from_secs(3)),
+            c.update(&req, 650, t + Duration::from_secs(4)),
             vec![Allocation::Layer(1)]
         );
     }

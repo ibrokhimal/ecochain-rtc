@@ -2,6 +2,51 @@
 
 Sana: 2026-11-18 (100 kishilik bo‘lim: 2026-11-20). Mashina: Apple Silicon Mac (10 yadro), macOS 26, Rust 1.96, Flutter 3.44.1 / Dart 3.12.1.
 
+## Adaptiv simulcast tekshiruvi — 2026-11-26
+
+Yangi tekshiruvlar `server/src/sfu/{layers,adaptation}.rs`,
+`server/src/room/video.rs` va `server/src/room/adaptation_tests.rs`da.
+
+- Budjet: 15% transport zaxirasi, eligible audio uchun 64 kbit/s, boshlang‘ich
+  800 kbit/s, nol/katta qiymatlar, priority va qatlam yuqori chegarasi.
+- Fake vaqt bilan 2 s / 20% recovery gate, zaxira yetmay qolishi, yetarli
+  zaxira bilan kichik TWCC pasayishlari, track ID qayta tartiblanishi.
+- Haqiqiy ICE + DTLS-SRTP: bitta q/h/f publisher va 300/800/2500 kbit/s
+  **test-only baholar** bilan uch receiver. Qabul qilingan synthetic qatlam
+  marker’lari q/h/f ekanligi tekshiriladi; boshqa qatlamga kadr sizmaydi.
+  Faqat bittasida video pauza/resume, audio va qolgan receiver’lar davom etadi.
+- Single-encoding kamera pauzadan yangi keyframe bilan qaytadi; qo‘shimcha
+  `subscriber.offer` bo‘lmaydi. Forwarding gate single-encoding (RID yo‘q)
+  va oldingi RID’ga qaytishda delta frame’ni keyframe’dan oldin o‘tkazmaydi.
+- **Haqiqiy TWCC sinovi:** test-only UDP relay receiver downlink’ini
+  4 Mbit/s → 120 kbit/s → 4 Mbit/s qiladi. 150 ms navbat sig‘maganda
+  SRTP/padding paketlari tushadi. Bu sinovda baho inject qilinmaydi:
+  server TWCC bahosi 250 kbit/s’dan pastga tushadi va video pauza bo‘ladi;
+  audio hamda oddiy yo‘ldagi ikkinchi receiver ishlashda davom etadi.
+  Cheklov olinganda yangi keyframe bilan video, keyin `Layer(2)` tiklanadi.
+  Alohida muvaffaqiyatli run’da tiklangan baho 2841 kbit/s bo‘ldi.
+
+Relay faqat downlink SRTP’ni cheklaydi; ICE/DTLS/RTCP va uplink erkin.
+Bu real internetning barcha sharoitlarini (TURN, Wi-Fi radio, ikki tomonlama
+loss, mobil CPU) modellashtirmaydi. Synthetic VP8 kadrlar SFU, RTP va
+qatlam tanlovini tekshiradi; haqiqiy kamera dekoderi tasvirini isbotlamaydi.
+Ushbu o‘zgarish uchun telefon/brauzerda qo‘lda tasvir sinovi bajarilmadi.
+
+Oldin yuborilgan kadrlar RTX yoki qabul qiluvchi buferidan pauzadan keyin
+ham kelishi mumkin. Shaped test serverning yangi video yozish hisoblagichi
+pauzada o‘zgarmasligini tekshiradi; qabul qilingan kech kadrlarni yangi
+forwarding bilan adashtirmaydi. Test override, relay va hisoblagichlar
+`cfg(test)` ostida: production binary, HTTP yoki signaling’da mavjud emas.
+
+Yangi 5 ta room adaptation testi birgalikda o‘tdi (42.48 s); mavjud
+`tests/media.rs` 14/14 o‘tdi (63.57 s). Single-encoding startup sinovlarida
+TWCC probing + recovery uchun 20 s gacha vaqt ajratildi; leaver testi avval
+video kelganini tekshiradi. Bu real qurilmada o‘lchangan latency SLA emas.
+
+Socket’li testlar sandbox tashqarisida lokal UDP/TCP ruxsati bilan ishlatildi.
+Timing uchun alohida synthetic xonalar CPU’ni bo‘lishmasligi uchun to‘liq
+tekshiruv `cargo test -- --test-threads=1` bilan bajariladi.
+
 ## Buyruqlar
 
 ```bash

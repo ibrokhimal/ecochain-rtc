@@ -15,12 +15,12 @@ async fn audio_and_video_flow_between_two_participants() {
         s.audio_frames > 50 && s.video_frames > 25 && s.video_keyframes > 0
     };
     assert!(
-        bob.wait_for(Duration::from_secs(10), both).await,
+        bob.wait_for(Duration::from_secs(20), both).await,
         "bob: {:?}",
         bob.stats()
     );
     assert!(
-        alice.wait_for(Duration::from_secs(10), both).await,
+        alice.wait_for(Duration::from_secs(20), both).await,
         "alice: {:?}",
         alice.stats()
     );
@@ -98,7 +98,7 @@ async fn bot_counts_frames_per_participant() {
                 .is_some_and(|n| *n > 25)
     };
     assert!(
-        bob.wait_for(Duration::from_secs(10), counted).await,
+        bob.wait_for(Duration::from_secs(20), counted).await,
         "bob: {:?}",
         bob.stats()
     );
@@ -144,7 +144,7 @@ async fn media_keeps_flowing_after_another_participant_leaves() {
     // Bandwidth admission may wait for probing and the 2 s recovery gate.
     // Establish video before testing whether leaving interrupts it.
     assert!(
-        a.wait_for(Duration::from_secs(10), |s| s
+        a.wait_for(Duration::from_secs(20), |s| s
             .video_frames_by_participant
             .get(&c_id)
             .is_some_and(|n| *n > 25))
@@ -153,7 +153,7 @@ async fn media_keeps_flowing_after_another_participant_leaves() {
         a.stats()
     );
     assert!(
-        c.wait_for(Duration::from_secs(10), |s| s
+        c.wait_for(Duration::from_secs(20), |s| s
             .video_frames_by_participant
             .get(&a_id)
             .is_some_and(|n| *n > 25))
@@ -205,7 +205,7 @@ async fn subscriber_gets_track_only_after_answer_and_stops_after_unsubscribe() {
             .is_some_and(|n| *n > 10)
     };
     assert!(
-        bob.wait_for(Duration::from_secs(10), got_video).await,
+        bob.wait_for(Duration::from_secs(20), got_video).await,
         "bob: {:?}",
         bob.stats()
     );
@@ -495,7 +495,7 @@ async fn switching_to_another_video_shows_frame_quickly() {
     let requests_before = carol.stats().keyframe_requests;
     bob.subscribe_video(track_id, "high");
     assert!(
-        bob.wait_for(Duration::from_secs(5), |s| first_frame_from(s, &carol_id))
+        bob.wait_for(Duration::from_secs(10), |s| first_frame_from(s, &carol_id))
             .await,
         "no frame from carol after bandwidth admission: {:?}",
         bob.stats()

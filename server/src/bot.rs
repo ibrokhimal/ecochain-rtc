@@ -187,6 +187,9 @@ impl SignalClient {
     }
 }
 
+#[cfg(test)]
+pub(crate) mod test_transport;
+
 /// What the bot publishes and receives.
 #[derive(Debug, Clone)]
 pub struct BotOptions {
@@ -241,6 +244,8 @@ pub struct BotStats {
     pub audio_frames_by_participant: HashMap<String, u64>,
     /// Video frames received, by the participant that published them.
     pub video_frames_by_participant: HashMap<String, u64>,
+    /// Synthetic video frames by (publisher, layer), for SFU diagnostics.
+    pub video_frames_by_layer: HashMap<(String, usize), u64>,
     /// Tracks of remote participants: `(participant, track, kind)`.
     pub remote_tracks: Vec<(String, String, String)>,
     /// Video track ids this bot is currently subscribed to.
@@ -275,6 +280,31 @@ impl Bot {
         let stats = Arc::new(Mutex::new(BotStats::default()));
         let (control, control_rx) = mpsc::unbounded_channel();
         let mut runner = Runner::connect(options, stats.clone()).await?;
+        let task = tokio::spawn(async move {
+            let reason = match runner.run(control_rx).await {
+                Ok(reason) => reason,
+                Err(e) => e.to_string(),
+            };
+            runner.stats.lock().expect("stats").stopped = Some(reason);
+        });
+        Ok(Bot {
+            control,
+            stats,
+            task,
+        })
+    }
+
+    /// Same bot over a test-only bidirectional relay with a shaped downlink.
+    #[cfg(test)]
+    pub(crate) async fn start_shaped(
+        options: BotOptions,
+        link: Arc<test_transport::Link>,
+    ) -> Result<Bot, BotError> {
+        let stats = Arc::new(Mutex::new(BotStats::default()));
+        let (control, control_rx) = mpsc::unbounded_channel();
+        let mut runner = Runner::connect(options, stats.clone()).await?;
+        runner.sub_local = link.attach(runner.sub_local);
+        runner.test_link = Some(link);
         let task = tokio::spawn(async move {
             let reason = match runner.run(control_rx).await {
                 Ok(reason) => reason,
@@ -368,6 +398,8 @@ struct Publisher {
 }
 
 struct Runner {
+    #[cfg(test)]
+    test_link: Option<Arc<test_transport::Link>>,
     options: BotOptions,
     stats: Arc<Mutex<BotStats>>,
     signal: SignalClient,
@@ -403,6 +435,8 @@ impl Runner {
         let (sub_socket, sub_local) = bind(options.bind_ip).await?;
         let audio_muted = options.audio_muted;
         let mut runner = Self {
+            #[cfg(test)]
+            test_link: None,
             publisher: new_publisher(options.bind_ip).await?,
             options,
             stats,
@@ -601,6 +635,8 @@ impl Runner {
                     let mut next = received.ok();
                     for _ in 0..64 {
                         let Some((len, source)) = next else { break };
+                        #[cfg(test)]
+                        let source = self.test_link.as_ref().map_or(source, |link| link.source(source));
                         if let (false, Some(sub)) = (in_outage, self.subscriber.as_mut()) {
                             if let Some(input) = receive(source, self.sub_local, &sub_buf[..len]).filter(|i| sub.accepts(i)) {
                                 let _ = sub.handle_input(input);
@@ -667,7 +703,17 @@ impl Runner {
                     Output::Timeout(_) => break,
                     Output::Transmit(t) => {
                         if !in_outage {
-                            let _ = socket.try_send_to(&t.contents, t.destination);
+                            #[cfg(test)]
+                            let destination = if i == 1 {
+                                self.test_link
+                                    .as_ref()
+                                    .map_or(t.destination, |link| link.destination(t.destination))
+                            } else {
+                                t.destination
+                            };
+                            #[cfg(not(test))]
+                            let destination = t.destination;
+                            let _ = socket.try_send_to(&t.contents, destination);
                         }
                     }
                     Output::Event(Event::MediaData(data)) if i == 1 => {
@@ -689,6 +735,12 @@ impl Runner {
                                 stats.video_keyframes += 1;
                             }
                             if let Some(p) = participant {
+                                if let Some(layer) = synthetic_layer(&data.data) {
+                                    *stats
+                                        .video_frames_by_layer
+                                        .entry((p.clone(), layer))
+                                        .or_default() += 1;
+                                }
                                 *stats
                                     .video_frames_by_participant
                                     .entry(p.clone())
@@ -772,7 +824,7 @@ impl Runner {
                 Some((_, rid)) => writer.rid(Rid::from(rid)),
                 None => writer,
             };
-            let _ = writer.write(pt, now, time, vp8_frame(keyframe, size));
+            let _ = writer.write(pt, now, time, vp8_frame(keyframe, size, index));
         }
     }
 
@@ -1070,12 +1122,40 @@ fn find_pt(writer: &str0m::media::Writer<'_>, codec: Codec) -> Option<str0m::med
 
 /// A VP8 frame with a valid frame tag. Keyframes carry the start code and
 /// a 640x360 size so depacketizers recognize them.
-fn vp8_frame(keyframe: bool, size: usize) -> Vec<u8> {
+fn vp8_frame(keyframe: bool, size: usize, layer: usize) -> Vec<u8> {
     let mut frame = if keyframe {
         vec![0x10, 0x02, 0x00, 0x9d, 0x01, 0x2a, 0x80, 0x02, 0x68, 0x01]
     } else {
         vec![0x11, 0x02, 0x00]
     };
-    frame.resize(size.max(frame.len()), 0x55);
+    frame.resize(size.max(15), 0x55);
+    frame[10..14].copy_from_slice(b"ECLY");
+    frame[14] = layer as u8;
     frame
+}
+
+/// Recognize only this load generator's marker, never arbitrary video payloads.
+fn synthetic_layer(frame: &[u8]) -> Option<usize> {
+    (frame.get(10..14)? == b"ECLY").then_some(())?;
+    let layer = *frame.get(14)?;
+    (layer < 3).then_some(usize::from(layer))
+}
+
+#[cfg(test)]
+mod synthetic_video_tests {
+    use super::*;
+
+    #[test]
+    fn synthetic_layer_marker_roundtrips_and_rejects_truncation() {
+        for keyframe in [false, true] {
+            for layer in 0..3 {
+                let frame = vp8_frame(keyframe, 200, layer);
+                assert_eq!(synthetic_layer(&frame), Some(layer));
+                for len in 0..15 {
+                    assert_eq!(synthetic_layer(&frame[..len]), None);
+                }
+            }
+        }
+        assert_eq!(synthetic_layer(&[0x55; 20]), None);
+    }
 }
