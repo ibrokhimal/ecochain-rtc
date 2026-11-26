@@ -33,6 +33,39 @@ class RtcReconnectPolicy {
   final Duration giveUpAfter;
 }
 
+/// How the meeting appears as a call of the phone itself: lock screen and
+/// Dynamic Island on iOS (CallKit), a call notification on Android.
+@immutable
+class RtcSystemCall {
+  /// Creates the description. Texts are shown as they are.
+  const RtcSystemCall({
+    required this.title,
+    this.ongoingText = 'Ongoing meeting',
+    this.pausedText = 'Microphone and camera are off',
+    this.muteLabel = 'Mute',
+    this.unmuteLabel = 'Unmute',
+    this.hangUpLabel = 'Leave',
+  });
+
+  /// Name of the meeting. It is visible on the lock screen.
+  final String title;
+
+  /// Android: second line of the notification.
+  final String ongoingText;
+
+  /// Android: second line while sending is paused.
+  final String pausedText;
+
+  /// Android: button that turns the microphone off.
+  final String muteLabel;
+
+  /// Android: button that turns the microphone on.
+  final String unmuteLabel;
+
+  /// Android: button that leaves the meeting (before Android 12).
+  final String hangUpLabel;
+}
+
 /// Everything needed to join a room.
 ///
 /// ```dart
@@ -54,6 +87,7 @@ class RtcConnectOptions {
     this.simulcast = true,
     this.maxVideoSubscriptions,
     this.reconnect = const RtcReconnectPolicy(),
+    this.systemCall,
     this.allowInsecureLocalhost = false,
     this.requestTimeout = const Duration(seconds: 10),
   });
@@ -87,6 +121,11 @@ class RtcConnectOptions {
   /// Reconnect behavior.
   final RtcReconnectPolicy reconnect;
 
+  /// Show the meeting as a system call on Android and iOS, so that it stays
+  /// alive in the background and can be controlled from the lock screen.
+  /// `null` (default) does not. Needs app setup, see the package README.
+  final RtcSystemCall? systemCall;
+
   /// Allow plain `ws://` to loopback and private LAN addresses. For local
   /// development only; production must use `wss://` with a valid
   /// certificate. Certificate checks are never disabled by the SDK.
@@ -105,6 +144,7 @@ class RtcConnectOptions {
     simulcast: simulcast,
     maxVideoSubscriptions: maxVideoSubscriptions,
     reconnect: reconnect,
+    systemCall: systemCall,
     allowInsecureLocalhost: allowInsecureLocalhost,
     requestTimeout: requestTimeout,
   );

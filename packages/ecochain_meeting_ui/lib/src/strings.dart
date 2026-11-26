@@ -57,6 +57,22 @@ abstract final class MeetingStrings {
     RtcConnectionState.disconnected => 'Uchrashuv tugadi',
   };
 
+  /// The meeting as a call of the phone (lock screen, notification).
+  static RtcSystemCall systemCall(String title) => RtcSystemCall(
+    title: title,
+    ongoingText: 'Uchrashuv davom etmoqda',
+    pausedText: 'Mikrofon va kamera vaqtincha yopiq',
+    muteLabel: 'Ovozsiz',
+    unmuteLabel: 'Ovozli',
+    hangUpLabel: leave,
+  );
+
+  /// Shown while the SDK sends nothing.
+  static String paused(RtcSendPauseReason reason) => switch (reason) {
+    RtcSendPauseReason.phoneCall => 'Telefon qo‘ng‘irog‘i: audio va video yuborilmayapti',
+    RtcSendPauseReason.screenLocked => 'Ekran qulflangan: audio va video yuborilmayapti',
+  };
+
   /// Explanation of why a session ended.
   static String reason(RtcDisconnectReason? reason) => switch (reason) {
     RtcDisconnectReason.left || null => 'Siz uchrashuvdan chiqdingiz.',

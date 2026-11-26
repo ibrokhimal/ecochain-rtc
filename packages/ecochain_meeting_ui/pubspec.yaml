@@ -12,8 +12,10 @@ dependencies:
     sdk: flutter
   ecochain_rtc:
     path: ../ecochain_rtc
+  wakelock_plus: ^1.8.2
 
 dev_dependencies:
   flutter_test:
     sdk: flutter
   flutter_lints: ^6.0.0
+  wakelock_plus_platform_interface: ^1.7.0

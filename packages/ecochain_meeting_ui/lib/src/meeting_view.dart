@@ -4,7 +4,9 @@ import 'package:ecochain_rtc/ecochain_rtc.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
+import 'keep_awake.dart';
 import 'strings.dart';
+import 'tile_layout.dart';
 
 /// The in-call screen: gallery, status banner and controls.
 ///
@@ -12,6 +14,8 @@ import 'strings.dart';
 /// example to go back to a chat) leaves the call running; only the leave
 /// button or the host ending the meeting stops it. Opening a new
 /// [MeetingView] for the same session shows the call as it is.
+///
+/// The screen does not auto-lock while the view shows an active call.
 ///
 /// [onMinimize] adds a back/minimize button, used by apps that embed the
 /// meeting next to other screens.
@@ -43,11 +47,17 @@ class _MeetingViewState extends State<MeetingView> {
   String? _notice;
   StreamSubscription<RtcEvent>? _events;
 
+  final _keepAwake = KeepAwake();
+
   RtcSession get _session => widget.session;
+
+  void _updateKeepAwake() => _keepAwake.set(_session.isActive);
 
   @override
   void initState() {
     super.initState();
+    _session.addListener(_updateKeepAwake);
+    _updateKeepAwake();
     _events = _session.events.listen((event) {
       if (event is RtcParticipantJoined && mounted) {
         _showNotice('${event.participant.name} qo‘shildi');
@@ -57,6 +67,8 @@ class _MeetingViewState extends State<MeetingView> {
 
   @override
   void dispose() {
+    _session.removeListener(_updateKeepAwake);
+    _keepAwake.set(false);
     unawaited(_events?.cancel());
     super.dispose();
   }
@@ -85,7 +97,10 @@ class _MeetingViewState extends State<MeetingView> {
         final participants = session.participants;
         final pinned = participants.where((p) => p.id == _pinned).firstOrNull;
         final presenter = participants.where((p) => p.screen != null && !p.screen!.muted).firstOrNull;
-        final spotlight = presenter ?? pinned;
+        // Two people: the other one fills the stage and we float on top of it.
+        final remote = participants.where((p) => !p.isLocal).firstOrNull;
+        final duo = presenter == null && participants.length == 2 && participants.any((p) => p.isLocal);
+        final spotlight = presenter ?? pinned ?? (duo ? remote : null);
         final gallery = [
           for (final p in participants)
             if (p.id != spotlight?.id || presenter != null) p,
@@ -129,6 +144,7 @@ class _MeetingViewState extends State<MeetingView> {
                       : _Stage(
                           spotlight: spotlight,
                           showScreen: presenter != null,
+                          duo: duo,
                           gallery: gallery,
                           onTap: (p) => setState(() => _pinned = _pinned == p.id ? null : p.id),
                           pinnedId: _pinned,
@@ -171,6 +187,7 @@ class _StatusBanner extends StatelessWidget {
       RtcConnectionState.connecting => (Colors.blueGrey, MeetingStrings.state(state)),
       RtcConnectionState.reconnecting => (Colors.orange.shade800, MeetingStrings.state(state)),
       RtcConnectionState.disconnected => (Colors.red.shade800, MeetingStrings.state(state)),
+      _ when session.sendingPaused => (Colors.orange.shade800, MeetingStrings.paused(session.sendPauseReasons.last)),
       _ => switch (session.lastError) {
         // A device that failed to open is shown until the next successful
         // toggle, so a silently missing camera is never a mystery.
@@ -202,6 +219,7 @@ class _Stage extends StatelessWidget {
   const _Stage({
     required this.spotlight,
     required this.showScreen,
+    required this.duo,
     required this.gallery,
     required this.onTap,
     required this.pinnedId,
@@ -209,6 +227,9 @@ class _Stage extends StatelessWidget {
 
   final RtcParticipant? spotlight;
   final bool showScreen;
+
+  /// Float the gallery's only participant over the spotlight.
+  final bool duo;
   final List<RtcParticipant> gallery;
   final ValueChanged<RtcParticipant> onTap;
   final String? pinnedId;
@@ -218,26 +239,46 @@ class _Stage extends StatelessWidget {
     return LayoutBuilder(
       builder: (context, constraints) {
         final wide = constraints.maxWidth >= 720;
-        final grid = _Gallery(participants: gallery, onTap: onTap, pinnedId: pinnedId, wide: wide);
         final spot = spotlight;
-        if (spot == null) return grid;
-        final main = Padding(
-          padding: const EdgeInsets.all(8),
-          child: ParticipantTile(participant: spot, showScreen: showScreen, onTap: () => onTap(spot), pinned: true),
+        if (spot == null) return _Gallery(participants: gallery, onTap: onTap, pinnedId: pinnedId);
+        final tile = ParticipantTile(
+          participant: spot,
+          showScreen: showScreen,
+          onTap: () => onTap(spot),
+          pinned: spot.id == pinnedId,
         );
+        final main = Padding(padding: const EdgeInsets.all(8), child: tile);
         if (gallery.isEmpty) return main;
+        if (duo) {
+          final other = gallery.single;
+          return Stack(
+            fit: StackFit.expand,
+            children: [
+              main,
+              _Floating(
+                child: ParticipantTile(participant: other, onTap: () => onTap(other), compact: true),
+              ),
+            ],
+          );
+        }
+        final strip = _Strip(
+          participants: gallery,
+          onTap: onTap,
+          pinnedId: pinnedId,
+          axis: wide ? Axis.vertical : Axis.horizontal,
+        );
         // Desktop: spotlight left, strip right. Mobile: spotlight on top.
         return wide
             ? Row(
                 children: [
                   Expanded(flex: 3, child: main),
-                  SizedBox(width: 280, child: grid),
+                  SizedBox(width: 220, child: strip),
                 ],
               )
             : Column(
                 children: [
                   Expanded(flex: 3, child: main),
-                  SizedBox(height: 150, child: grid),
+                  SizedBox(height: 160, child: strip),
                 ],
               );
       },
@@ -245,44 +286,152 @@ class _Stage extends StatelessWidget {
   }
 }
 
+const _gap = 8.0;
+
 class _Gallery extends StatelessWidget {
-  const _Gallery({required this.participants, required this.onTap, required this.pinnedId, required this.wide});
+  const _Gallery({required this.participants, required this.onTap, required this.pinnedId});
 
   final List<RtcParticipant> participants;
   final ValueChanged<RtcParticipant> onTap;
   final String? pinnedId;
-  final bool wide;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.all(_gap),
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final area = constraints.biggest;
+          final count = participants.length;
+          final grid = tileGrid(count: count, area: area, gap: _gap);
+          if (grid.scrolls) {
+            return Center(
+              child: SizedBox(
+                width: grid.columns * (grid.tile.width + _gap) - _gap,
+                child: GridView.builder(
+                  padding: EdgeInsets.zero,
+                  itemCount: count,
+                  gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                    crossAxisCount: grid.columns,
+                    mainAxisSpacing: _gap,
+                    crossAxisSpacing: _gap,
+                    childAspectRatio: grid.tile.aspectRatio,
+                  ),
+                  itemBuilder: (context, index) => _tile(participants[index], onTap, pinnedId),
+                ),
+              ),
+            );
+          }
+          final rects = tileRects(count: count, area: area, columns: grid.columns, tile: grid.tile, gap: _gap);
+          return Stack(
+            children: [
+              for (final (i, p) in participants.indexed)
+                Positioned.fromRect(key: ValueKey(p.id), rect: rects[i], child: _tile(p, onTap, pinnedId)),
+            ],
+          );
+        },
+      ),
+    );
+  }
+}
+
+/// A single line of small tiles next to the spotlight.
+class _Strip extends StatelessWidget {
+  const _Strip({required this.participants, required this.onTap, required this.pinnedId, required this.axis});
+
+  final List<RtcParticipant> participants;
+  final ValueChanged<RtcParticipant> onTap;
+  final String? pinnedId;
+  final Axis axis;
+
+  @override
+  Widget build(BuildContext context) {
+    return ListView.builder(
+      scrollDirection: axis,
+      padding: const EdgeInsets.all(_gap / 2),
+      itemCount: participants.length,
+      itemBuilder: (context, index) => Padding(
+        key: ValueKey(participants[index].id),
+        padding: const EdgeInsets.all(_gap / 2),
+        child: AspectRatio(
+          aspectRatio: axis == Axis.vertical ? 16 / 9 : 3 / 4,
+          child: _tile(participants[index], onTap, pinnedId, compact: true),
+        ),
+      ),
+    );
+  }
+}
+
+Widget _tile(RtcParticipant p, ValueChanged<RtcParticipant> onTap, String? pinnedId, {bool compact = false}) =>
+    ParticipantTile(
+      key: ValueKey(p.id),
+      participant: p,
+      onTap: () => onTap(p),
+      pinned: p.id == pinnedId,
+      compact: compact,
+    );
+
+/// The small picture of a two-person call. It can be dragged and settles in
+/// the nearest corner.
+class _Floating extends StatefulWidget {
+  const _Floating({required this.child});
+
+  final Widget child;
+
+  @override
+  State<_Floating> createState() => _FloatingState();
+}
+
+class _FloatingState extends State<_Floating> {
+  static const _margin = 20.0;
+
+  Alignment _corner = Alignment.bottomRight;
+  Offset? _drag;
 
   @override
   Widget build(BuildContext context) {
     return LayoutBuilder(
       builder: (context, constraints) {
-        final count = participants.length;
-        // Mobile: one column for 1-2 people, two columns beyond. Desktop:
-        // roughly square grid.
-        final columns = wide ? (count <= 1 ? 1 : (count <= 4 ? 2 : (count <= 9 ? 3 : 4))) : (count <= 2 ? 1 : 2);
-        final rows = (count / columns).ceil().clamp(1, 1000);
-        final fitHeight = constraints.maxHeight / rows - 8;
-        final tileWidth = constraints.maxWidth / columns - 8;
-        final aspect = (tileWidth / fitHeight.clamp(120, 10000)).clamp(0.6, 16 / 9);
-        return GridView.builder(
-          padding: const EdgeInsets.all(4),
-          itemCount: count,
-          gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-            crossAxisCount: columns,
-            childAspectRatio: aspect,
-            mainAxisSpacing: 8,
-            crossAxisSpacing: 8,
-          ),
-          itemBuilder: (context, index) {
-            final p = participants[index];
-            return ParticipantTile(
-              key: ValueKey(p.id),
-              participant: p,
-              onTap: () => onTap(p),
-              pinned: p.id == pinnedId,
-            );
-          },
+        final size = floatingTileSize(constraints.biggest);
+        final room = Rect.fromLTRB(
+          _margin,
+          _margin,
+          constraints.maxWidth - size.width - _margin,
+          constraints.maxHeight - size.height - _margin,
+        );
+        if (room.width < 0 || room.height < 0) return const SizedBox.shrink();
+        final at = _drag ?? _corner.withinRect(room);
+        return Stack(
+          children: [
+            AnimatedPositioned(
+              duration: _drag == null ? const Duration(milliseconds: 200) : Duration.zero,
+              curve: Curves.easeOut,
+              left: at.dx,
+              top: at.dy,
+              width: size.width,
+              height: size.height,
+              child: GestureDetector(
+                onPanStart: (_) => setState(() => _drag = at),
+                onPanUpdate: (d) => setState(() {
+                  final next = (_drag ?? at) + d.delta;
+                  _drag = Offset(next.dx.clamp(room.left, room.right), next.dy.clamp(room.top, room.bottom));
+                }),
+                onPanEnd: (_) => setState(() {
+                  final p = _drag ?? at;
+                  _corner = Alignment(p.dx < room.center.dx ? -1 : 1, p.dy < room.center.dy ? -1 : 1);
+                  _drag = null;
+                }),
+                onPanCancel: () => setState(() => _drag = null),
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(12),
+                    boxShadow: const [BoxShadow(color: Colors.black54, blurRadius: 12)],
+                  ),
+                  child: widget.child,
+                ),
+              ),
+            ),
+          ],
         );
       },
     );
@@ -299,6 +448,7 @@ class ParticipantTile extends StatelessWidget {
     this.showScreen = false,
     this.onTap,
     this.pinned = false,
+    this.compact = false,
   });
 
   /// Who to show.
@@ -312,6 +462,9 @@ class ParticipantTile extends StatelessWidget {
 
   /// Draw the pinned marker.
   final bool pinned;
+
+  /// Smaller avatar, for small tiles.
+  final bool compact;
 
   @override
   Widget build(BuildContext context) {
@@ -334,12 +487,14 @@ class ParticipantTile extends StatelessWidget {
             RtcVideoView(
               track: track,
               mirror: p.isLocal && !showScreen,
-              cover: !showScreen,
               placeholder: Center(
                 child: CircleAvatar(
-                  radius: 32,
+                  radius: compact ? 22 : 32,
                   backgroundColor: const Color(0xff00776d),
-                  child: Text(initials, style: const TextStyle(fontSize: 26, color: Colors.white)),
+                  child: Text(
+                    initials,
+                    style: TextStyle(fontSize: compact ? 18 : 26, color: Colors.white),
+                  ),
                 ),
               ),
             ),
@@ -392,6 +547,7 @@ class _Controls extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final active = session.connectionState == RtcConnectionState.connected;
+    final canSend = active && !session.sendingPaused;
     final mobile = defaultTargetPlatform == TargetPlatform.android || defaultTargetPlatform == TargetPlatform.iOS;
     final desktop = defaultTargetPlatform == TargetPlatform.macOS || defaultTargetPlatform == TargetPlatform.windows;
     return Container(
@@ -406,19 +562,19 @@ class _Controls extends StatelessWidget {
             icon: session.microphoneEnabled ? Icons.mic : Icons.mic_off,
             label: MeetingStrings.microphone,
             off: !session.microphoneEnabled,
-            onPressed: active ? () => onError(() => session.setMicrophoneEnabled(!session.microphoneEnabled)) : null,
+            onPressed: canSend ? () => onError(() => session.setMicrophoneEnabled(!session.microphoneEnabled)) : null,
           ),
           _RoundButton(
             icon: session.cameraEnabled ? Icons.videocam : Icons.videocam_off,
             label: MeetingStrings.camera,
             off: !session.cameraEnabled,
-            onPressed: active ? () => onError(() => session.setCameraEnabled(!session.cameraEnabled)) : null,
+            onPressed: canSend ? () => onError(() => session.setCameraEnabled(!session.cameraEnabled)) : null,
           ),
           if (mobile)
             _RoundButton(
               icon: Icons.cameraswitch_outlined,
               label: MeetingStrings.switchCamera,
-              onPressed: active && session.cameraEnabled ? () => onError(session.switchCamera) : null,
+              onPressed: canSend && session.cameraEnabled ? () => onError(session.switchCamera) : null,
             ),
           if (desktop)
             _RoundButton(
@@ -473,6 +629,8 @@ class _RoundButton extends StatelessWidget {
           style: IconButton.styleFrom(
             backgroundColor: background,
             foregroundColor: foreground,
+            disabledBackgroundColor: const Color(0xff22282e),
+            disabledForegroundColor: Colors.white38,
             minimumSize: const Size(52, 52),
           ),
           onPressed: onPressed,

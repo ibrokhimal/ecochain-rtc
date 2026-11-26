@@ -57,3 +57,12 @@ enum RtcDisconnectReason {
   /// Any other server or protocol error.
   error,
 }
+
+/// Why the SDK temporarily sends neither audio nor video.
+enum RtcSendPauseReason {
+  /// The screen is locked.
+  screenLocked,
+
+  /// A phone call rings or is in progress.
+  phoneCall,
+}

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:ui' show ImageFilter;
 
 import 'package:flutter/widgets.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
@@ -11,6 +12,9 @@ import 'participant.dart';
 /// mounts and released when it unmounts, so tiles can be scrolled in and out
 /// freely. Media of the track itself belongs to the session and is not
 /// affected by this widget's lifetime.
+///
+/// The whole frame is visible by default: it is fitted inside the area and the
+/// space left around it is filled with a blurred copy of the same video.
 ///
 /// Shows [placeholder] while the track is muted or no frame has arrived.
 ///
@@ -27,7 +31,7 @@ class RtcVideoView extends StatefulWidget {
     super.key,
     required this.track,
     this.mirror = false,
-    this.cover = true,
+    this.cover = false,
     this.placeholder = const SizedBox.shrink(),
   });
 
@@ -37,8 +41,7 @@ class RtcVideoView extends StatefulWidget {
   /// Mirror horizontally; use for the local front camera.
   final bool mirror;
 
-  /// Fill the area (cropping) instead of letterboxing. Use `false` for
-  /// screen shares so no content is cut off.
+  /// Fill the area by cropping the frame instead of showing all of it.
   final bool cover;
 
   /// Shown when there is nothing to render.
@@ -98,6 +101,42 @@ class _RtcVideoViewState extends State<RtcVideoView> {
     super.dispose();
   }
 
+  Widget _video({required bool cover}) => RTCVideoView(
+    _renderer,
+    mirror: widget.mirror,
+    objectFit: cover
+        ? RTCVideoViewObjectFit.RTCVideoViewObjectFitCover
+        : RTCVideoViewObjectFit.RTCVideoViewObjectFitContain,
+  );
+
+  /// A dimmed, blurred copy of the video behind the fitted one. It shares the
+  /// renderer, so nothing is decoded twice, and is left out when the frame
+  /// already fills the area.
+  Widget _blurredFill() => LayoutBuilder(
+    builder: (context, constraints) => ValueListenableBuilder<RTCVideoValue>(
+      valueListenable: _renderer,
+      builder: (context, value, child) {
+        final area = constraints.biggest;
+        if (area.isEmpty || (area.aspectRatio / value.aspectRatio - 1).abs() < 0.01) {
+          return const SizedBox.shrink();
+        }
+        return child!;
+      },
+      child: ClipRect(
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            ImageFiltered(
+              imageFilter: ImageFilter.blur(sigmaX: 20, sigmaY: 20, tileMode: TileMode.mirror),
+              child: _video(cover: true),
+            ),
+            const ColoredBox(color: Color(0x40000000)),
+          ],
+        ),
+      ),
+    ),
+  );
+
   @override
   Widget build(BuildContext context) {
     final track = widget.track;
@@ -105,14 +144,8 @@ class _RtcVideoViewState extends State<RtcVideoView> {
     return Stack(
       fit: StackFit.expand,
       children: [
-        if (visible)
-          RTCVideoView(
-            _renderer,
-            mirror: widget.mirror,
-            objectFit: widget.cover
-                ? RTCVideoViewObjectFit.RTCVideoViewObjectFitCover
-                : RTCVideoViewObjectFit.RTCVideoViewObjectFitContain,
-          ),
+        if (visible && !widget.cover) _blurredFill(),
+        if (visible) _video(cover: widget.cover),
         if (!visible || !_hasFrame) widget.placeholder,
       ],
     );

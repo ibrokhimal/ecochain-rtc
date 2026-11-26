@@ -25,6 +25,7 @@ To‘liq ro‘yxatni yangilash: `cargo metadata --format-version 1` yoki `cargo 
 | `dart_webrtc` | 1.8.2 | MIT |
 | `webrtc_interface` | 1.5.1 | MIT |
 | `web_socket_channel` | 3.0.3 | BSD-3-Clause |
+| `wakelock_plus` | 1.8.2 | BSD-3-Clause |
 | Native WebRTC (`WebRTC-SDK` / `io.github.webrtc-sdk:android` 150.7871.04, libwebrtc asosida) | — | BSD-3-Clause + qo‘shimcha patent grant (WebRTC), ichidagi uchinchi tomon kodlari (Opus — BSD, libvpx — BSD, BoringSSL — OpenSSL/ISC, va h.k.) |
 
 Flutter ilovalarda `LicenseRegistry` orqali Dart paketlari litsenziyalari avtomatik `showLicensePage` ga tushadi. Native libwebrtc bildirishnomalarini (`LICENSE`, `PATENTS`, `third_party` litsenziyalari) ilova “Litsenziyalar” sahifasiga yoki tarqatish paketiga qo‘shish kerak.

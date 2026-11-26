@@ -86,6 +86,22 @@ await session.stopScreenShare();
 
 Chaqiruvlar navbatga qo‘yiladi: tez-tez bosish ikkinchi kamerani ochmaydi, oxirgi so‘ralgan holat qoladi.
 
+### Qulf va telefon qo‘ng‘irog‘i
+
+Android va iOS’da ekran qulflansa yoki telefonga qo‘ng‘iroq kelsa, SDK mikrofon, kamera va ekranni o‘zi bo‘shatadi (boshqalarga “muted” ko‘rinadi). Ilova yana oldinga chiqqanda foydalanuvchi tanlovi tiklanadi; ekran ulashish tiklanmaydi. Qabul qilish davom etadi. Holat: `session.sendingPaused`, `session.sendPauseReasons`.
+
+* iOS’da qulf uchun rasmiy hodisa yo‘q: ba’zan qulflangandan bir necha soniya keyin, parolsiz qurilmada esa umuman aniqlanmasligi mumkin. Qo‘ng‘iroqlar `CXCallObserver` orqali.
+* Android’da qo‘ng‘iroq audio rejimidan aniqlanadi (ruxsat kerak emas). Ovozsiz rejimda u faqat javob berilganda seziladi; boshqa VoIP ilovalar (Telegram, WhatsApp) qo‘ng‘irog‘i sezilmaydi.
+
+### Tizim qo‘ng‘irog‘i (qulf ekrani)
+
+`RtcConnectOptions(systemCall: RtcSystemCall(title: 'Jamoa uchrashuvi'))` berilsa, uchrashuv telefonning o‘z qo‘ng‘irog‘idek ko‘rinadi: iOS’da CallKit, Android’da foreground service va `CallStyle` bildirishnomasi (Android 12+; eskisida oddiy bildirishnoma). `title` qulf ekranida hammaga ko‘rinadi. Qulfda mikrofon va kamera baribir yopiq turadi va u yerdan yoqib bo‘lmaydi.
+
+* **iOS**: `UIBackgroundModes` ga `audio` bilan birga `voip` kerak. Boshqa qo‘ng‘iroq “hold” qilsa, yuborish to‘xtaydi.
+* **Android**: ruxsatlar va service plugin manifestidan keladi; Android 13+ da bildirishnoma ruxsati ulangandan keyin so‘raladi. Google Play’da foreground service turlari (`microphone`, `mediaPlayback`) deklaratsiya qilinishi kerak.
+
+Ilova yopiq paytda jiringlatish (PushKit/FCM) kirmaydi.
+
 ### Hodisalar
 
 ```dart

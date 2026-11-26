@@ -67,6 +67,7 @@ class _MeetingRoute extends StatelessWidget {
                 token: request.token,
                 microphone: request.microphone,
                 camera: request.camera,
+                systemCall: MeetingStrings.systemCall('Jamoa uchrashuvi'),
                 allowInsecureLocalhost: true,
               ),
             ),

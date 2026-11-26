@@ -7,8 +7,10 @@ import 'connection_state.dart';
 import 'errors.dart';
 import 'events.dart';
 import 'internal/backoff.dart';
+import 'internal/interruptions.dart';
 import 'internal/serial.dart';
 import 'internal/signal_client.dart';
+import 'internal/system_call.dart';
 import 'options.dart';
 import 'participant.dart';
 import 'subscription_policy.dart';
@@ -64,7 +66,17 @@ const _cameraLayers = [('q', 4.0, 150000), ('h', 2.0, 500000), ('f', 1.0, 150000
 /// are needed for audio/video calls.
 class RtcSession extends ChangeNotifier {
   /// Creates an idle session.
-  RtcSession();
+  ///
+  /// [interruptions] replaces the OS signals in tests.
+  RtcSession({@visibleForTesting Stream<Set<RtcSendPauseReason>> Function()? interruptions})
+    : _interruptions = interruptions ?? platformInterruptions;
+
+  final Stream<Set<RtcSendPauseReason>> Function() _interruptions;
+  StreamSubscription<Set<RtcSendPauseReason>>? _interruptionEvents;
+  Set<RtcSendPauseReason> _pauseReasons = const {};
+  Set<RtcSendPauseReason> _osPauseReasons = const {};
+  bool _held = false;
+  final _systemCall = SystemCall();
 
   final _events = StreamController<RtcEvent>.broadcast();
   final _media = Serial();
@@ -146,6 +158,17 @@ class RtcSession extends ChangeNotifier {
   /// Whether this device shares its screen.
   bool get screenShareEnabled => _wantScreen && _localTracks.containsKey(RtcTrackSource.screen);
 
+  /// Why nothing is sent right now; empty in normal operation.
+  ///
+  /// While the phone is locked or has a call, microphone, camera and screen
+  /// are released and the others see them muted. Receiving goes on.
+  /// Microphone and camera come back when the app is in front again, if the
+  /// user still wants them on; a screen share has to be started again.
+  Set<RtcSendPauseReason> get sendPauseReasons => _pauseReasons;
+
+  /// Whether sending is blocked, see [sendPauseReasons].
+  bool get sendingPaused => _pauseReasons.isNotEmpty;
+
   /// Whether the local participant is the host.
   bool get isHost => _localInfo?['role'] == 'host';
 
@@ -221,6 +244,14 @@ class RtcSession extends ChangeNotifier {
     _disconnectReason = null;
     _lastError = null;
     _sessionId = null;
+    unawaited(_interruptionEvents?.cancel());
+    _pauseReasons = const {};
+    _osPauseReasons = const {};
+    _held = false;
+    _interruptionEvents = _interruptions().listen((reasons) {
+      _osPauseReasons = reasons;
+      _updatePause();
+    });
     _setState(RtcConnectionState.connecting);
     return _connectFuture = _connect(generation);
   }
@@ -240,6 +271,8 @@ class RtcSession extends ChangeNotifier {
       unawaited(Helper.setSpeakerphoneOn(true).catchError((_) {}));
     }
     await _applyLocalMedia(generation);
+    // Last, so that it never competes with the device permission dialogs.
+    if (_alive(generation)) _systemCall.requestPermission();
   }
 
   /// Leaves the meeting and releases camera, microphone, peer connections
@@ -282,6 +315,7 @@ class RtcSession extends ChangeNotifier {
     if (_disposed) return;
     _disposed = true;
     _generation++;
+    _systemCall.end();
     unawaited(_release().whenComplete(_events.close));
     super.dispose();
   }
@@ -395,12 +429,34 @@ class RtcSession extends ChangeNotifier {
     _notify();
   });
 
-  bool _wants(RtcTrackSource source) => switch (source) {
-    RtcTrackSource.microphone => _wantMicrophone,
-    RtcTrackSource.camera => _wantCamera,
-    RtcTrackSource.screen => _wantScreen,
-    RtcTrackSource.screenAudio => false,
-  };
+  void _updatePause() {
+    final reasons = {..._osPauseReasons, if (_held) RtcSendPauseReason.phoneCall};
+    if (!isActive || setEquals(reasons, _pauseReasons)) return;
+    final changed = reasons.isEmpty == sendingPaused;
+    _pauseReasons = reasons;
+    if (changed) {
+      if (sendingPaused) {
+        _wantScreen = false;
+        // Silence and blacken at once; releasing the devices is queued and
+        // may have to wait for other media work.
+        for (final track in _localTracks.values) {
+          track.enabled = false;
+        }
+      }
+      // While connecting, the devices are opened after joining anyway.
+      if (_state != RtcConnectionState.connecting) unawaited(_applyLocalMedia(_generation));
+    }
+    _notify();
+  }
+
+  bool _wants(RtcTrackSource source) =>
+      !sendingPaused &&
+      switch (source) {
+        RtcTrackSource.microphone => _wantMicrophone,
+        RtcTrackSource.camera => _wantCamera,
+        RtcTrackSource.screen => _wantScreen,
+        RtcTrackSource.screenAudio => false,
+      };
 
   /// Brings one source in line with the user's choice. Runs on [_media].
   Future<void> _applySource(RtcTrackSource source, int generation) async {
@@ -427,6 +483,9 @@ class RtcSession extends ChangeNotifier {
         await _addSender(source, track, stream);
         await _negotiatePublisher(generation);
       }
+    } else if (want && current != null) {
+      // A pause may have ended before its release ran.
+      if (!current.enabled) current.enabled = true;
     } else if (!want && current != null) {
       _localTracks.remove(source);
       final stream = _localStreams.remove(source);
@@ -436,6 +495,17 @@ class RtcSession extends ChangeNotifier {
       await _sendMute(source, true);
     }
   }
+
+  /// Capture size to ask for. Phone sensors are 4:3 and a 16:9 mode cuts off
+  /// part of the picture before it is even sent, so phones ask for 4:3.
+  ///
+  /// The plugin picks the mode with the smallest |dw| + |dh|. This target
+  /// prefers 1280x960, then 1440x1080, and falls back to 1280x720 before any
+  /// square (cropped) or full HD mode. Webcams are natively 16:9.
+  static (int, int) get _cameraSize => switch (defaultTargetPlatform) {
+    TargetPlatform.iOS || TargetPlatform.android when !kIsWeb => (1300, 990),
+    _ => (1280, 720),
+  };
 
   Future<(MediaStream, MediaStreamTrack)> _capture(RtcTrackSource source) async {
     try {
@@ -451,9 +521,11 @@ class RtcSession extends ChangeNotifier {
             'audio': false,
             'video': {
               'facingMode': 'user',
-              'width': {'ideal': 1280},
-              'height': {'ideal': 720},
-              'frameRate': {'ideal': 25},
+              // Plain numbers mean "ideal"; flutter_webrtc 1.6.3 ignores the
+              // {'ideal': n} form on Android, iOS and macOS.
+              'width': _cameraSize.$1,
+              'height': _cameraSize.$2,
+              'frameRate': 25,
             },
           });
         case RtcTrackSource.screen:
@@ -1166,6 +1238,11 @@ class RtcSession extends ChangeNotifier {
 
   /// Stops devices, closes peers and the socket, clears participant state.
   Future<void> _release() async {
+    unawaited(_interruptionEvents?.cancel());
+    _interruptionEvents = null;
+    _pauseReasons = const {};
+    _osPauseReasons = const {};
+    _held = false;
     _subscriptionTimer?.cancel();
     _iceTimer?.cancel();
     final signal = _signal;
@@ -1237,7 +1314,43 @@ class RtcSession extends ChangeNotifier {
   }
 
   void _notify() {
-    if (!_disposed) notifyListeners();
+    if (_disposed) return;
+    _syncSystemCall();
+    notifyListeners();
+  }
+
+  void _syncSystemCall() {
+    final call = _options?.systemCall;
+    if (call == null || !isActive) {
+      _systemCall.end();
+      return;
+    }
+    _systemCall.show(
+      call,
+      connected: _state != RtcConnectionState.connecting,
+      muted: !_wantMicrophone || sendingPaused,
+      paused: sendingPaused,
+      actions: (
+        onMute: (muted) {
+          // The lock screen must not undo a pause, not even for later.
+          if (sendingPaused || muted == !_wantMicrophone) {
+            unawaited(Future.microtask(_notify));
+            return;
+          }
+          unawaited(
+            setMicrophoneEnabled(!muted).catchError((Object e) {
+              if (e is RtcException) _lastError = e;
+              _notify();
+            }),
+          );
+        },
+        onHold: (held) {
+          _held = held;
+          _updatePause();
+        },
+        onHangUp: () => unawaited(leave()),
+      ),
+    );
   }
 
   void _checkNotDisposed() {

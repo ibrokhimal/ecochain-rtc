@@ -43,6 +43,7 @@ class _MeetAppState extends State<MeetApp> {
       token: request.token,
       microphone: request.microphone,
       camera: request.camera,
+      systemCall: MeetingStrings.systemCall('Ecochain Meet'),
       allowInsecureLocalhost: true,
     ),
   );
