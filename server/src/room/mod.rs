@@ -6,10 +6,13 @@
 //! processes every command in order, concurrent joins, duplicate requests and
 //! a leave racing a reconnect are resolved deterministically without locks.
 
+#[cfg(test)]
+mod adaptation_tests;
 mod audio;
 mod keyframe;
 mod media;
 mod participant;
+mod video;
 
 pub use participant::Connection;
 

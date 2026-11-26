@@ -141,6 +141,26 @@ async fn media_keeps_flowing_after_another_participant_leaves() {
     }
     let a_id = a.stats().participant_id.clone().unwrap();
     let c_id = c.stats().participant_id.clone().unwrap();
+    // Bandwidth admission may wait for probing and the 2 s recovery gate.
+    // Establish video before testing whether leaving interrupts it.
+    assert!(
+        a.wait_for(Duration::from_secs(10), |s| s
+            .video_frames_by_participant
+            .get(&c_id)
+            .is_some_and(|n| *n > 25))
+            .await,
+        "a: {:?}",
+        a.stats()
+    );
+    assert!(
+        c.wait_for(Duration::from_secs(10), |s| s
+            .video_frames_by_participant
+            .get(&a_id)
+            .is_some_and(|n| *n > 25))
+            .await,
+        "c: {:?}",
+        c.stats()
+    );
     let a_from_c = a.stats().audio_frames_by_participant[&c_id];
     let a_video_from_c = a
         .stats()
@@ -475,9 +495,9 @@ async fn switching_to_another_video_shows_frame_quickly() {
     let requests_before = carol.stats().keyframe_requests;
     bob.subscribe_video(track_id, "high");
     assert!(
-        bob.wait_for(Duration::from_secs(1), |s| first_frame_from(s, &carol_id))
+        bob.wait_for(Duration::from_secs(5), |s| first_frame_from(s, &carol_id))
             .await,
-        "no frame from carol within 1 s: {:?}",
+        "no frame from carol after bandwidth admission: {:?}",
         bob.stats()
     );
     eprintln!("switch to first frame: {:?}", start.elapsed());

@@ -132,12 +132,8 @@ pub struct OutTrack {
     pub state: OutState,
     /// Requested quality.
     pub quality: Quality,
-    /// Simulcast layer we want to forward.
-    pub target_rid: Option<Rid>,
-    /// Video suspended by the bandwidth allocator, independent of SDP state.
-    pub bandwidth_paused: bool,
-    /// Simulcast layer currently forwarded (switches happen on keyframes).
-    pub current_rid: Option<Rid>,
+    /// Video pause, selected encoding, and independent keyframe gate.
+    pub video: super::video::VideoGate,
     /// Keeps RTP time continuous across layer switches.
     pub timeline: Timeline,
 }

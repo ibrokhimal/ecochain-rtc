@@ -236,10 +236,17 @@ impl Room {
                 let Some(out) = sub.out.iter().find(|o| o.state.mid() == Some(request.mid)) else {
                     return;
                 };
+                if out.video.allocation == layers::Allocation::Paused {
+                    return;
+                }
                 let (track_id, publisher_id, rid) = (
                     out.track_id.clone(),
                     out.publisher_id.clone(),
-                    out.current_rid.or(out.target_rid),
+                    if out.video.waiting {
+                        out.video.target_rid
+                    } else {
+                        out.video.current_rid
+                    },
                 );
                 self.request_keyframe(&publisher_id, &track_id, rid, request.kind, false);
             }
@@ -255,6 +262,7 @@ impl Room {
                         "bandwidth estimate"
                     );
                 }
+                self.allocate_layers(index);
             }
             (_, Event::IceConnectionStateChange(state)) => {
                 tracing::debug!(room = %self.id, participant = participant_id, ?kind, ?state, "ice state");
@@ -436,6 +444,9 @@ impl Room {
                 Outbound::event("participant.updated", json!({"participant": info})),
             );
         }
+        for other in 0..self.participants.len() {
+            self.allocate_layers(other);
+        }
         Ok(())
     }
 
@@ -527,11 +538,13 @@ impl Room {
         for out in &mut sub.out {
             if let OutState::Negotiating(mid) = out.state {
                 out.state = OutState::Open(mid);
-                if out.kind == MediaKind::Video {
+                if out.kind == MediaKind::Video
+                    && out.video.allocation != layers::Allocation::Paused
+                {
                     opened.push((
                         out.publisher_id.clone(),
                         out.track_id.clone(),
-                        out.target_rid,
+                        out.video.target_rid,
                     ));
                 }
             }
@@ -672,7 +685,6 @@ impl Room {
                     kind: track.kind,
                     source: track.source,
                     quality,
-                    lowest_rid: track.layers.first().copied(),
                 });
             }
         }
@@ -727,9 +739,7 @@ impl Room {
                     source: d.source,
                     state: OutState::ToOpen,
                     quality: d.quality,
-                    target_rid: d.lowest_rid,
-                    bandwidth_paused: false,
-                    current_rid: None,
+                    video: Default::default(),
                     timeline: Default::default(),
                 });
             }
@@ -905,23 +915,21 @@ impl Room {
                 continue;
             };
 
-            if out.bandwidth_paused {
-                continue;
-            }
-            let mut switched = false;
-            if data.rid.is_some() && data.rid != out.current_rid {
-                if data.rid != out.target_rid {
-                    continue;
-                }
-                if !data.is_keyframe() {
-                    if !wanted_keyframe.contains(&out.target_rid) {
-                        wanted_keyframe.push(out.target_rid);
+            let switched = if out.kind == MediaKind::Video {
+                let Some(switched) = out.video.accept(data.rid, data.is_keyframe()) else {
+                    if out.video.allocation != layers::Allocation::Paused
+                        && out.video.waiting
+                        && data.rid == out.video.target_rid
+                        && !wanted_keyframe.contains(&out.video.target_rid)
+                    {
+                        wanted_keyframe.push(out.video.target_rid);
                     }
                     continue;
-                }
-                switched = out.current_rid.is_some();
-                out.current_rid = data.rid;
-            }
+                };
+                switched
+            } else {
+                false
+            };
             let time = out.timeline.map(data.time, data.network_time, switched);
             let Some(mut writer) = sub.peer.rtc.writer(mid) else {
                 continue;
@@ -1056,71 +1064,131 @@ impl Room {
         self.keyframes_due = next;
     }
 
-    /// Picks the simulcast layer per forwarded video track from requested
-    /// quality and the subscriber's bandwidth estimate.
-    fn allocate_layers(&mut self, index: usize) {
-        let layer_counts: Vec<(String, Vec<Rid>)> = self
+    /// Eligible subscribed remote audio, independent of instantaneous speaker silence.
+    pub(super) fn audio_demand_counts(&self, index: usize) -> (usize, usize) {
+        let me = &self.participants[index];
+        let Some(sub) = &me.subscriber else {
+            return (0, 0);
+        };
+        let mut microphones = 0;
+        let mut screens = 0;
+        for publisher in self.participants.iter().filter(|p| p.id != me.id) {
+            for track in &publisher.tracks {
+                if track.muted
+                    || me.muted_audio.contains(&track.id)
+                    || !sub
+                        .out
+                        .iter()
+                        .any(|o| o.track_id == track.id && o.state.is_wanted())
+                {
+                    continue;
+                }
+                match track.source {
+                    TrackSource::Microphone => microphones += 1,
+                    TrackSource::ScreenAudio => screens += 1,
+                    _ => {}
+                }
+            }
+        }
+        (microphones, screens)
+    }
+
+    /// Allocate video independently for this receiver, reserving audio and overhead.
+    pub(super) fn allocate_layers(&mut self, index: usize) {
+        let now = Instant::now();
+        let speakers: HashSet<_> = self
+            .current_speakers(now)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        let (microphones, screen_audio) = self.audio_demand_counts(index);
+        let audio_limit = self.services.config.rooms.max_forwarded_audio;
+        let tracks: HashMap<_, _> = self
             .participants
             .iter()
             .flat_map(|p| p.tracks.iter())
             .filter(|t| t.kind == MediaKind::Video)
-            .map(|t| (t.id.clone(), t.layers.clone()))
+            .map(|t| (t.id.clone(), (t.layers.clone(), t.muted)))
             .collect();
         let participant = &mut self.participants[index];
         let Some(sub) = participant.subscriber.as_mut() else {
             return;
         };
-        let videos: Vec<usize> = (0..sub.out.len())
-            .filter(|&i| sub.out[i].kind == MediaKind::Video && sub.out[i].state.is_wanted())
-            .collect();
-        let rids_of = |track_id: &str| {
-            layer_counts
-                .iter()
-                .find(|(id, _)| id == track_id)
-                .map(|(_, rids)| rids.clone())
-                .unwrap_or_default()
-        };
-        let demands: Vec<VideoDemand> = videos
+        let videos: Vec<_> = sub
+            .out
             .iter()
-            .map(|&i| VideoDemand {
-                layers: rids_of(&sub.out[i].track_id).len(),
-                quality: sub.out[i].quality,
-                screen: sub.out[i].source == TrackSource::Screen,
-                speaker: false,
+            .enumerate()
+            .filter(|(_, o)| o.kind == MediaKind::Video && o.state.is_wanted())
+            .filter(|(_, o)| tracks.get(&o.track_id).is_some_and(|(_, muted)| !muted))
+            .map(|(i, _)| i)
+            .collect();
+        let requests: Vec<_> = videos
+            .iter()
+            .map(|&i| {
+                let out = &sub.out[i];
+                (
+                    out.track_id.as_str(),
+                    VideoDemand {
+                        layers: tracks[&out.track_id].0.len(),
+                        quality: out.quality,
+                        screen: out.source == TrackSource::Screen,
+                        speaker: speakers.contains(&out.publisher_id),
+                    },
+                )
             })
             .collect();
-        let budget = crate::sfu::adaptation::video_budget(sub.estimate_kbps, 0, 0, 0);
-        let chosen = layers::allocate(&demands, budget);
-        let mut desired_kbps = 0;
+        let budget = crate::sfu::adaptation::video_budget(
+            sub.estimate_kbps,
+            microphones,
+            screen_audio,
+            audio_limit,
+        );
+        let chosen = sub.adaptation.update(&requests, budget, now);
+        let desired_video: u64 = requests
+            .iter()
+            .map(|(_, d)| d.cost_kbps(layers::Allocation::Layer(d.requested_layer())))
+            .sum();
+        drop(requests);
+        let selected: HashMap<_, _> = videos.into_iter().zip(chosen).collect();
         let mut changed = Vec::new();
-        for (slot, &i) in videos.iter().enumerate() {
-            let rids = rids_of(&sub.out[i].track_id);
-            let selected = chosen[slot];
-            sub.out[i].bandwidth_paused = selected == layers::Allocation::Paused;
-            let target = match selected {
-                layers::Allocation::Layer(layer) => rids.get(layer).copied(),
+        for (i, out) in sub
+            .out
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, o)| o.kind == MediaKind::Video)
+        {
+            let allocation = selected
+                .get(&i)
+                .copied()
+                .unwrap_or(layers::Allocation::Paused);
+            let target = match allocation {
+                layers::Allocation::Layer(layer) => tracks
+                    .get(&out.track_id)
+                    .and_then(|(rids, _)| rids.get(layer))
+                    .copied(),
                 layers::Allocation::Paused => None,
             };
-            desired_kbps += layers::LAYER_KBPS[demands[slot].requested_layer().min(2)];
-            let out = &mut sub.out[i];
-            if out.target_rid != target {
-                out.target_rid = target;
-                // An out that is not open yet gets its urgent request when
-                // the answer opens it; asking now would burn the throttle
-                // window before the m-line can receive the keyframe.
-                if matches!(out.state, OutState::Open(_)) {
-                    changed.push((out.publisher_id.clone(), out.track_id.clone(), target));
-                }
+            let previous = out.video.allocation;
+            let request = out.video.configure(allocation, target);
+            if previous != allocation {
+                tracing::debug!(participant = %participant.id, track = %out.track_id,
+                    estimate_kbps = ?sub.estimate_kbps, video_budget_kbps = budget,
+                    ?previous, ?allocation, "video allocation changed");
+            }
+            if request && matches!(out.state, OutState::Open(_)) {
+                changed.push((out.publisher_id.clone(), out.track_id.clone(), target));
             }
         }
-        // Let the estimator probe up to what the receiver asked for.
-        if desired_kbps > 0 {
-            sub.peer
-                .rtc
-                .bwe()
-                .set_bitrate(Bitrate::kbps(300), Bitrate::kbps(desired_kbps + 100));
-            sub.peer.wake(Instant::now());
-        }
+        // Keep a probe target even with every video paused. Include the 20% recovery
+        // margin, audio, and transport reserve so BWE can reach the upgrade threshold.
+        // str0m caps padding at its live estimate and suppresses it during overuse.
+        let audio = (microphones.min(audio_limit) + screen_audio) as u64 * 64;
+        let desired = (desired_video * 120 + audio * 100).div_ceil(85) + 100;
+        sub.peer
+            .rtc
+            .bwe()
+            .set_bitrate(Bitrate::kbps(desired), Bitrate::kbps(desired));
+        sub.peer.wake(now);
         for (publisher_id, track_id, rid) in changed {
             self.request_keyframe(
                 &publisher_id,
@@ -1234,7 +1302,6 @@ struct Desired {
     kind: MediaKind,
     source: TrackSource,
     quality: Quality,
-    lowest_rid: Option<Rid>,
 }
 
 fn validate_tracks(tracks: &[OfferedTrack]) -> Result<(), ProtocolError> {
