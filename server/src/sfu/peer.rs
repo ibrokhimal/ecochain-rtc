@@ -16,7 +16,8 @@ use str0m::{
 
 /// Initial bandwidth estimate for subscriber peers, before TWCC feedback
 /// arrives. Low enough to start with the medium layer on a phone.
-const INITIAL_SUBSCRIBER_BITRATE: Bitrate = Bitrate::kbps(800);
+const INITIAL_SUBSCRIBER_BITRATE: Bitrate =
+    Bitrate::kbps(super::adaptation::INITIAL_SUBSCRIBER_KBPS);
 
 /// Which side offers on this peer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

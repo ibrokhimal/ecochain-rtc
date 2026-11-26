@@ -728,6 +728,7 @@ impl Room {
                     state: OutState::ToOpen,
                     quality: d.quality,
                     target_rid: d.lowest_rid,
+                    bandwidth_paused: false,
                     current_rid: None,
                     timeline: Default::default(),
                 });
@@ -904,6 +905,9 @@ impl Room {
                 continue;
             };
 
+            if out.bandwidth_paused {
+                continue;
+            }
             let mut switched = false;
             if data.rid.is_some() && data.rid != out.current_rid {
                 if data.rid != out.target_rid {
@@ -1082,14 +1086,21 @@ impl Room {
                 layers: rids_of(&sub.out[i].track_id).len(),
                 quality: sub.out[i].quality,
                 screen: sub.out[i].source == TrackSource::Screen,
+                speaker: false,
             })
             .collect();
-        let chosen = layers::allocate(&demands, sub.estimate_kbps);
+        let budget = crate::sfu::adaptation::video_budget(sub.estimate_kbps, 0, 0, 0);
+        let chosen = layers::allocate(&demands, budget);
         let mut desired_kbps = 0;
         let mut changed = Vec::new();
         for (slot, &i) in videos.iter().enumerate() {
             let rids = rids_of(&sub.out[i].track_id);
-            let target = rids.get(chosen[slot]).copied();
+            let selected = chosen[slot];
+            sub.out[i].bandwidth_paused = selected == layers::Allocation::Paused;
+            let target = match selected {
+                layers::Allocation::Layer(layer) => rids.get(layer).copied(),
+                layers::Allocation::Paused => None,
+            };
             desired_kbps += layers::LAYER_KBPS[demands[slot].requested_layer().min(2)];
             let out = &mut sub.out[i];
             if out.target_rid != target {

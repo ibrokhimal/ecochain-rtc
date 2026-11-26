@@ -10,12 +10,20 @@ use std::time::Instant;
 use str0m::media::MediaTime;
 
 /// Nominal bitrate of layer 0, 1 and 2 in kbps. The Flutter SDK configures
-/// its encodings with the same numbers (`maxBitrate`), see
-/// `packages/ecochain_rtc/lib/src/media/publish_options.dart`.
+/// its encodings with the same numbers (`maxBitrate`) in `session.dart`.
 pub const LAYER_KBPS: [u64; 3] = [150, 500, 1500];
 
 /// Estimated cost of a track without simulcast.
 const SINGLE_LAYER_KBPS: u64 = 800;
+
+/// A video can be suspended without tearing down its negotiated receiver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Allocation {
+    /// No video fits the available budget.
+    Paused,
+    /// Index into the publisher RID list, or zero for a single encoding.
+    Layer(usize),
+}
 
 /// One video subscription that needs a layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,6 +34,8 @@ pub struct VideoDemand {
     pub quality: Quality,
     /// Screen shares are served first.
     pub screen: bool,
+    /// The publisher is currently speaking.
+    pub speaker: bool,
 }
 
 impl VideoDemand {
@@ -34,7 +44,7 @@ impl VideoDemand {
         if self.layers == 0 {
             return 0;
         }
-        let top = self.layers - 1;
+        let top = self.layers.min(3) - 1;
         match self.quality {
             Quality::Low => 0,
             Quality::Medium => top.min(1),
@@ -43,44 +53,52 @@ impl VideoDemand {
     }
 }
 
-/// Chooses a layer index for every demand.
-///
-/// Every simulcast track gets at least layer 0 so that no tile goes black
-/// when bandwidth is short. The remaining budget upgrades tracks in
-/// priority order: screen shares, then higher requested quality.
-/// Without an estimate (`budget_kbps = None`) everybody gets what they asked.
-pub fn allocate(demands: &[VideoDemand], budget_kbps: Option<u64>) -> Vec<usize> {
-    let mut chosen = vec![0usize; demands.len()];
-    let Some(budget) = budget_kbps else {
-        return demands.iter().map(VideoDemand::requested_layer).collect();
-    };
-
-    let mut used: u64 = demands
-        .iter()
-        .map(|d| {
-            if d.layers == 0 {
-                SINGLE_LAYER_KBPS
-            } else {
-                LAYER_KBPS[0]
+impl VideoDemand {
+    /// Conservative payload cost of an allocation, in kilobits per second.
+    pub fn cost_kbps(&self, allocation: Allocation) -> u64 {
+        match allocation {
+            Allocation::Paused => 0,
+            Allocation::Layer(_) if self.layers == 0 => {
+                if self.screen {
+                    1500
+                } else {
+                    SINGLE_LAYER_KBPS
+                }
             }
-        })
-        .sum();
+            Allocation::Layer(i) => LAYER_KBPS[i.min(2)],
+        }
+    }
+}
 
+/// Admit base layers by stable priority, then spend remaining budget on upgrades.
+pub fn allocate(demands: &[VideoDemand], budget_kbps: u64) -> Vec<Allocation> {
+    let mut chosen = vec![Allocation::Paused; demands.len()];
+    let mut remaining = budget_kbps;
     let mut order: Vec<usize> = (0..demands.len()).collect();
-    order.sort_by_key(|&i| (!demands[i].screen, std::cmp::Reverse(demands[i].quality)));
-
-    // Strict priority: a screen share or a pinned (high quality) tile is
-    // upgraded fully before lower priority tiles get anything above layer 0.
+    order.sort_by_key(|&i| {
+        let d = demands[i];
+        (!d.screen, d.quality != Quality::High, !d.speaker)
+    });
     for &i in &order {
-        let demand = demands[i];
-        while demand.layers > 0 && chosen[i] < demand.requested_layer() {
-            let extra = LAYER_KBPS[chosen[i] + 1] - LAYER_KBPS[chosen[i]];
-            if used + extra > budget {
+        let base = demands[i].cost_kbps(Allocation::Layer(0));
+        if base <= remaining {
+            chosen[i] = Allocation::Layer(0);
+            remaining -= base;
+        }
+    }
+    for i in order {
+        let Allocation::Layer(mut layer) = chosen[i] else {
+            continue;
+        };
+        while layer < demands[i].requested_layer() {
+            let extra = LAYER_KBPS[layer + 1] - LAYER_KBPS[layer];
+            if extra > remaining {
                 break;
             }
-            used += extra;
-            chosen[i] += 1;
+            remaining -= extra;
+            layer += 1;
         }
+        chosen[i] = Allocation::Layer(layer);
     }
     chosen
 }
@@ -126,27 +144,115 @@ mod tests {
             layers: 3,
             quality,
             screen,
+            speaker: false,
         }
     }
 
     #[test]
-    fn unlimited_budget_gives_requested_layers() {
-        let demands = [demand(Quality::High, false), demand(Quality::Low, false)];
-        assert_eq!(allocate(&demands, None), vec![2, 0]);
+    fn finite_budget_pauses_tracks_that_do_not_fit() {
+        let ds = [demand(Quality::High, false); 3];
+        assert_eq!(
+            allocate(&ds, 300),
+            vec![
+                Allocation::Layer(0),
+                Allocation::Layer(0),
+                Allocation::Paused
+            ]
+        );
+        assert_eq!(allocate(&ds, 0), vec![Allocation::Paused; 3]);
     }
 
     #[test]
-    fn short_budget_prefers_screen_share() {
-        let demands = [demand(Quality::High, false), demand(Quality::High, true)];
-        // 150 + 150 base, then 350 + 1000 for the screen share fits 1700;
-        // the camera upgrade (+350) does not fit any more.
-        assert_eq!(allocate(&demands, Some(1700)), vec![0, 2]);
+    fn selects_each_layer_and_respects_requested_ceiling() {
+        for (budget, want) in [
+            (149, Allocation::Paused),
+            (150, Allocation::Layer(0)),
+            (500, Allocation::Layer(1)),
+            (1500, Allocation::Layer(2)),
+        ] {
+            assert_eq!(
+                allocate(&[demand(Quality::High, false)], budget),
+                vec![want]
+            );
+        }
+        assert_eq!(
+            allocate(&[demand(Quality::Low, false)], 5000),
+            vec![Allocation::Layer(0)]
+        );
+        assert_eq!(
+            allocate(&[demand(Quality::Medium, false)], 5000),
+            vec![Allocation::Layer(1)]
+        );
     }
 
     #[test]
-    fn every_track_keeps_the_lowest_layer() {
-        let demands = [demand(Quality::High, false); 4];
-        assert_eq!(allocate(&demands, Some(100)), vec![0, 0, 0, 0]);
+    fn bases_are_admitted_before_upgrades() {
+        assert_eq!(
+            allocate(&[demand(Quality::High, false); 2], 1500),
+            vec![Allocation::Layer(1), Allocation::Layer(1)]
+        );
+    }
+
+    #[test]
+    fn prioritizes_screen_high_then_speaker_stably() {
+        let ordinary = demand(Quality::Medium, false);
+        let mut speaker = ordinary;
+        speaker.speaker = true;
+        let ds = [
+            ordinary,
+            speaker,
+            demand(Quality::High, false),
+            demand(Quality::High, true),
+        ];
+        assert_eq!(
+            allocate(&ds, 300),
+            vec![
+                Allocation::Paused,
+                Allocation::Paused,
+                Allocation::Layer(0),
+                Allocation::Layer(0)
+            ]
+        );
+        assert_eq!(
+            allocate(&[ordinary, speaker, ordinary], 150),
+            vec![Allocation::Paused, Allocation::Layer(0), Allocation::Paused]
+        );
+    }
+
+    #[test]
+    fn single_encoding_has_source_specific_cost() {
+        let camera = VideoDemand {
+            layers: 0,
+            ..demand(Quality::High, false)
+        };
+        let screen = VideoDemand {
+            layers: 0,
+            ..demand(Quality::High, true)
+        };
+        assert_eq!(allocate(&[camera], 799), vec![Allocation::Paused]);
+        assert_eq!(allocate(&[camera], 800), vec![Allocation::Layer(0)]);
+        assert_eq!(allocate(&[screen], 1499), vec![Allocation::Paused]);
+        assert_eq!(allocate(&[screen], 1500), vec![Allocation::Layer(0)]);
+        assert_eq!(
+            allocate(&[screen, demand(Quality::Low, false)], 150),
+            vec![Allocation::Paused, Allocation::Layer(0)]
+        );
+    }
+
+    #[test]
+    fn allocations_never_exceed_budget_for_supported_layer_counts() {
+        for layers in 0..=3 {
+            let ds = [VideoDemand {
+                layers,
+                ..demand(Quality::High, false)
+            }; 9];
+            for budget in [0, 100, 150, 500, 1500, 5000, u64::MAX] {
+                let chosen = allocate(&ds, budget);
+                let cost: u64 = ds.iter().zip(chosen).map(|(d, a)| d.cost_kbps(a)).sum();
+                assert!(cost <= budget);
+            }
+        }
+        assert!(allocate(&[], u64::MAX).is_empty());
     }
 
     #[test]
