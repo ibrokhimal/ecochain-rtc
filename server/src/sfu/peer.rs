@@ -10,8 +10,9 @@ use super::udp::{Datagram, MediaSockets, RoomPackets};
 use std::{net::SocketAddr, time::Instant};
 use str0m::{
     bwe::Bitrate,
+    format::Codec,
     net::{Protocol, Receive},
-    Candidate, Event, IceCreds, Input, Output, Rtc, RtcError,
+    Candidate, Event, IceCreds, Input, Output, Rtc, RtcConfig, RtcError,
 };
 
 /// Initial bandwidth estimate for subscriber peers, before TWCC feedback
@@ -46,19 +47,40 @@ pub struct Peer {
 /// making the server probe an unbounded list of addresses.
 const MAX_REMOTE_CANDIDATES: usize = 32;
 
+fn rtc_config(kind: PeerKind, creds: IceCreds) -> RtcConfig {
+    let mut config = Rtc::builder().set_local_ice_credentials(creds);
+    if kind == PeerKind::Subscriber {
+        // Only subscriber transports need bandwidth estimation.
+        config = config.enable_bwe(Some(INITIAL_SUBSCRIBER_BITRATE));
+    } else {
+        // str0m answers in its own codec order, not the offered order.
+        // Prefer native-friendly H264 but retain VP8 and every RTX mapping.
+        // This only negotiates the publisher codec; no media is transcoded.
+        config.codec_config().sort_by_key(|p| {
+            let spec = p.spec();
+            match spec.codec {
+                codec if codec.is_audio() => 0,
+                Codec::H264 if spec.format.packetization_mode == Some(1) => {
+                    if spec.format.profile_level_id.map(|id| id >> 8) == Some(0x42e0) {
+                        1
+                    } else {
+                        2
+                    }
+                }
+                Codec::Vp8 => 3,
+                _ => 4,
+            }
+        });
+    }
+    config
+}
+
 impl Peer {
     /// Creates a peer with host candidates for every media socket and
     /// registers its ICE ufrag so that STUN traffic reaches `room`.
     pub fn new(kind: PeerKind, sockets: &MediaSockets, room: &RoomPackets, now: Instant) -> Self {
         let creds = IceCreds::new();
-        let mut config = Rtc::builder().set_local_ice_credentials(creds.clone());
-        if kind == PeerKind::Subscriber {
-            // Bandwidth estimation drives simulcast layer selection per
-            // receiver. Publishers do not need it: the server never sends
-            // media on them.
-            config = config.enable_bwe(Some(INITIAL_SUBSCRIBER_BITRATE));
-        }
-        let rtc = config.build(now);
+        let rtc = rtc_config(kind, creds.clone()).build(now);
         sockets.register_ufrag(&creds.ufrag, room.clone());
         let mut peer = Self {
             rtc,
@@ -322,6 +344,74 @@ pub fn parse_candidate(line: &str) -> Option<Candidate> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use str0m::media::{Direction, MediaKind};
+
+    fn publisher_answer(vp8_only: bool) -> String {
+        crate::install_crypto();
+        let now = Instant::now();
+        let mut client_config = Rtc::builder();
+        if vp8_only {
+            client_config.codec_config().clear();
+            client_config.codec_config().enable_vp8(true);
+        }
+        let mut client = client_config.build(now);
+        let mut change = client.sdp_api();
+        change.add_media(MediaKind::Video, Direction::SendOnly, None, None, None);
+        let (offer, _) = change.apply().unwrap();
+        let mut server = rtc_config(PeerKind::Publisher, IceCreds::new()).build(now);
+        server
+            .sdp_api()
+            .accept_offer(offer)
+            .unwrap()
+            .to_sdp_string()
+    }
+
+    fn first_video_codec(sdp: &str) -> &str {
+        let line = sdp.lines().find(|l| l.starts_with("m=video ")).unwrap();
+        let pt = line.split_whitespace().nth(3).unwrap();
+        let prefix = format!("a=rtpmap:{pt} ");
+        sdp.lines().find_map(|l| l.strip_prefix(&prefix)).unwrap()
+    }
+
+    #[test]
+    fn publisher_answer_prefers_h264_and_keeps_vp8_and_rtx() {
+        let answer = publisher_answer(false);
+        assert_eq!(first_video_codec(&answer), "H264/90000");
+        assert!(answer.contains(" VP8/90000"));
+        let pt = answer
+            .lines()
+            .find(|l| l.starts_with("m=video "))
+            .unwrap()
+            .split_whitespace()
+            .nth(3)
+            .unwrap();
+        let prefix = format!("a=fmtp:{pt} ");
+        let fmtp = answer
+            .lines()
+            .find_map(|l| l.strip_prefix(&prefix))
+            .unwrap();
+        assert!(fmtp.contains("profile-level-id=42e01f"));
+        assert!(fmtp.contains("packetization-mode=1"));
+        let apt = format!("apt={pt}");
+        let rtx_line = answer
+            .lines()
+            .find(|l| l.starts_with("a=fmtp:") && l.split_whitespace().skip(1).any(|p| p == apt))
+            .unwrap();
+        let rtx = rtx_line
+            .strip_prefix("a=fmtp:")
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap();
+        assert!(answer.contains(&format!("a=rtpmap:{rtx} rtx/90000")));
+    }
+
+    #[test]
+    fn publisher_answer_accepts_vp8_only_devices() {
+        let answer = publisher_answer(true);
+        assert_eq!(first_video_codec(&answer), "VP8/90000");
+        assert!(!answer.contains(" H264/90000"));
+    }
 
     fn candidate(line: &str) -> Candidate {
         parse_candidate(line).expect("valid candidate")

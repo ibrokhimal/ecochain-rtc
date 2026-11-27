@@ -2,6 +2,56 @@
 
 Sana: 2026-11-18 (100 kishilik bo‘lim: 2026-11-20). Mashina: Apple Silicon Mac (10 yadro), macOS 26, Rust 1.96, Flutter 3.44.1 / Dart 3.12.1.
 
+## Native H.264 simulcast — 2026-11-27
+
+Kamera va ekran uchun SDK `setCodecPreferences` orqali H.264 mode 1 ni
+ustuvor qiladi; capability obyektlari, fmtp va RTX/RED/FEC saqlanadi.
+Publisher peer ham server SDP javobida constrained-baseline mode 1 H.264 ni
+oldinga qo‘yadi. str0m javobni o‘zining codec tartibidan tuzgani sababli
+SDK o‘zgarishining o‘zi native testda hali VP8 tanlagan edi.
+Subscriber BWE va video forwarding o‘zgarmagan: server decode/encode qilmaydi.
+
+Tekshiruvlar:
+
+- SDK: **38 PASS**, umumiy UI: **23 PASS**, Meet: **1 PASS**, Messenger: **1 PASS**.
+  Yangi 6 test codec/fmtp tartibi, capability va repair saqlanishi,
+  native API ishlamaganda ulanishni to‘xtatmaslikni tekshiradi.
+- Serverning haqiqiy SDP offer/answer regressiyasi: oldin birinchi codec
+  `VP8/90000` bo‘lib yiqildi; endi `H264/90000`, aynan shu payload mode 1,
+  `42e01f` va unga bog‘langan RTX `apt` bilan tekshiriladi.
+  VP8-only offer ham qabul qilinadi.
+- Server to‘liq `cargo test -- --test-threads=1`: **125 PASS / 0 FAIL**
+  (92 unit, 14 media, 6 resilience, 13 signaling).
+  `cargo fmt --check` va `cargo clippy --all-targets -- -D warnings`: PASS.
+- **Mac haqiqiy kamera → loopback SFU → native decoder: PASS**, 10 s.
+  Yangi dekodlangan kadrlar bilan H.264 q/h/f:
+  `320×180` (17 frame), `640×360` (100 frame), `1280×720` (186 frame).
+  Bu native encoder uchta alohida o‘lcham yaratib, SFU qatlam tanlovi
+  bilan receiver'ga yetganini tekshiradi.
+- SDK/UI/ikkala app `flutter analyze`: PASS.
+- `flutter build ios --debug --no-codesign`: PASS.
+  iPhone’da haqiqiy kamera/decoder sinovi hali bajarilmadi.
+
+Native test:
+
+```bash
+# Alohida terminal: lokal development server.
+cd server
+cargo run -- serve --config config/development.toml
+# Boshqa terminal:
+cd apps/meet
+flutter test integration_test/h264_simulcast_test.dart -d macos
+```
+
+Telefon uchun development server LAN’da ochiq bo‘lsin va testga
+`--dart-define=ECOCHAIN_RTC_URL=ws://<LAN-IP>:7880/v1/rtc` bering.
+Test OS kamera ruxsatini talab qiladi. Dastlabki UI `pump` kutishlariga
+bog‘langan variant 3 minutda timeout bo‘lgan; yakuniy test UI frame kutishisiz
+native receiver stats orqali dekodni tekshiradi va bosqich kutishlari cheklangan.
+Bu vizual mozaika yo‘qligi, hardware encoder ishlashi yoki batareya sarfi
+bo‘yicha benchmark emas. VP8 zaxirasi publisher muzokarasi uchundir;
+H.264 oqim serverda VP8-only receiver uchun qayta kodlanmaydi.
+
 ## Video reference-chain tiklanishi — 2026-11-26
 
 Qurilma kuzatuvi: remote VP8 video `720×540`, `25 FPS`, taxminan

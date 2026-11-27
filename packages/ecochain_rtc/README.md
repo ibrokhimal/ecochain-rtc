@@ -74,13 +74,36 @@ ListenableBuilder(
 );
 ```
 
+### Video codec va simulcast
+
+SDK kamera va ekran transceiver'larida H.264 `packetization-mode=1` ni
+birinchi tanlov qiladi: constrained baseline, keyin boshqa H.264 profillari,
+keyin VP8. Qurilma bergan capability va fmtp qiymatlari o‘zgartirilmaydi;
+RTX/RED/FEC hamda qolgan codeclar muzokarada saqlanadi. Codec tanlash API’si
+ishlamasa, WebRTC platformasining odatiy tanlovi ishlaydi. Bu preference;
+haqiqiy tanlangan codec’ni debug statistikasi ko‘rsatadi.
+
+Server ham publisher SDP javobida shu tartibni qo‘llaydi: str0m o‘zining
+codec tartibidan javob yaratadi, shuning uchun faqat app preference’i yetmaydi.
+Bu o‘zgarish uchun serverni ham yangilash kerak. VP8 zaxirasi publisher
+muzokarasi uchun; H.264 yuborilayotgan oqimni server VP8-only receiver uchun
+VP8 ga aylantirmaydi.
+
+Kamera odatdagidek qurilmaning o‘zida q/h/f qatlamlarini yaratadi
+(1/4, 1/2, to‘liq o‘lcham; 150/500/1500 kbit/s maksimum).
+Server videoni decode/encode qilmaydi: qabul qiluvchining tezligiga mos
+tayyor qatlamni uzatadi. Bu H.264 simulcast, spatial SVC emas.
+FFmpeg kerak emas. Native qurilmaning uchta H.264 encoder oqimini real
+vaqtda bera olishi qurilma testi bilan tekshiriladi; codec mavjudligi
+hardware tezlatish yoki uchta qatlam ishlayotganining isboti emas.
+
 ### Video debug statistikasi
 
 `flutter run --debug` bilan `RtcVideoView` har remote video ustida codec,
 haqiqiy frame o‘lchami, FPS va qabul qilinayotgan video bitrate’ini chiqaradi:
 
 ```text
-RX • VP8 • 640×360
+RX • H264 • 640×360
 25 FPS • 480 kbit/s
 ```
 
