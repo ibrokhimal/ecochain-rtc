@@ -107,10 +107,22 @@ listen = [{ bind_ip = "127.0.0.1" }]
     .unwrap();
     let (packets_tx, _) = mpsc::channel(100);
     Room {
+        collaboration: Default::default(),
+        persistence: Default::default(),
+        lobby: Default::default(),
+        recording: None,
+        recording_state: Value::Null,
+        recording_layers: Default::default(),
+        captions: None,
+        captions_state: Value::Null,
+        members: Default::default(),
+        commands: mpsc::channel(1).0,
         test_estimates: HashMap::new(),
         id: "adaptation".into(),
         max_participants: 25,
         services: RoomServices {
+            vault: None,
+            provider_slots: Arc::new(tokio::sync::Semaphore::new(8)),
             config,
             metrics,
             sockets,
@@ -656,4 +668,27 @@ async fn review_fully_active_single_video_does_not_fill_link_with_padding() {
     receiver.leave().await;
     publisher.leave().await;
     server.task.abort();
+}
+
+#[tokio::test]
+async fn screen_policy_and_pause_gate_both_screen_sources_before_background_taps() {
+    let mut room = fixture().await;
+    let mut p = participant("publisher");
+    p.tracks = vec![track("screen-a", TrackSource::ScreenAudio, false)];
+    room.participants.push(p);
+    add_receiver(&mut room);
+    assert!(room.screen_media_allowed("publisher", false));
+    room.collaboration.state["presentation"] =
+        json!({"kind":"screen","presenter_id":"publisher","paused":true});
+    assert!(!room.screen_media_allowed("publisher", false));
+    assert_eq!(room.audio_demand_counts(1), (0, 0));
+    room.collaboration.state["presentation"]["paused"] = json!(false);
+    assert!(room.screen_media_allowed("publisher", false));
+    room.collaboration.state["presentation_policy"] = json!("host_or_invited");
+    assert!(!room.screen_media_allowed("publisher", false));
+    assert!(room.screen_media_allowed("publisher", true));
+    room.collaboration.state["presentation"]["invited"] = json!(true);
+    assert!(room.screen_media_allowed("publisher", false));
+    room.collaboration.state["presentation"] = Value::Null;
+    assert!(!room.screen_media_allowed("publisher", false));
 }

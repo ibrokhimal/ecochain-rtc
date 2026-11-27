@@ -12,16 +12,20 @@
 //! * [`http`]: health, metrics, admin API.
 //! * [`bot`]: a headless str0m client used by tests and the load generator.
 
+pub mod archive;
 pub mod auth;
 pub mod bot;
 pub mod config;
 pub mod http;
 pub mod metrics;
 pub mod protocol;
+pub mod providers;
+pub mod recording;
 pub mod room;
 pub mod rooms;
 pub mod sfu;
 pub mod signaling;
+pub mod storage;
 pub mod turn;
 
 use config::Config;
@@ -39,6 +43,17 @@ pub struct App {
     pub config: Arc<Config>,
     /// Counters.
     pub metrics: Arc<Metrics>,
+    /// Encrypted archive storage, when configured.
+    pub vault: Option<Arc<storage::Vault>>,
+    /// Global bound for configured external-provider HTTP operations.
+    pub provider_slots: Arc<tokio::sync::Semaphore>,
+    /// Per-job weak locks serialize submissions without a permanent lock registry.
+    pub job_locks: std::sync::Mutex<
+        std::collections::HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>,
+    >,
+    /// One-use, short-lived native-to-browser playback handoffs.
+    pub playback_links:
+        std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, String, String)>>,
     /// Room registry.
     pub rooms: Arc<Rooms>,
     /// Source of connection ids.
@@ -93,8 +108,55 @@ pub async fn start(config: Config) -> anyhow::Result<Server> {
     }
     let media_addrs = sockets.advertised();
 
+    let vault = match &config.storage {
+        None => None,
+        Some(storage) => {
+            use base64::Engine;
+            let key: [u8; 32] = base64::engine::general_purpose::STANDARD
+                .decode(storage.master_key.expose())?
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("invalid storage key"))?;
+            let root = storage.path.clone();
+            let retention = storage.retention_secs;
+            Some(
+                tokio::task::spawn_blocking(move || storage::Vault::open(root, key, retention))
+                    .await??,
+            )
+        }
+    };
+    if let Some(vault) = vault.clone() {
+        let recovery_vault = vault.clone();
+        let temp_root = config.recording.as_ref().map(|r| r.temp_path.clone());
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            if let Some(root) = temp_root {
+                storage::remove_abandoned_worker_dirs(&root)?;
+            }
+            recovery_vault.recover_interrupted_jobs()?;
+            Ok(())
+        })
+        .await??;
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                interval.tick().await;
+                let vault = vault.clone();
+                let _ = tokio::task::spawn_blocking(move || vault.purge(auth::unix_now())).await;
+            }
+        });
+    }
+    let provider_slots = Arc::new(tokio::sync::Semaphore::new(8));
     let app = Arc::new(App {
-        rooms: Rooms::new(config.clone(), metrics.clone(), sockets.clone()),
+        rooms: Rooms::new(
+            config.clone(),
+            metrics.clone(),
+            sockets.clone(),
+            vault.clone(),
+            provider_slots.clone(),
+        ),
+        vault,
+        playback_links: Default::default(),
+        provider_slots,
+        job_locks: Default::default(),
         config: config.clone(),
         metrics,
         next_connection_id: AtomicU64::new(1),

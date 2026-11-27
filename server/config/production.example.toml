@@ -43,3 +43,47 @@ ice_servers = [
 # ttl_secs must be >= the longest meeting: the SDK only refreshes TURN
 # credentials on rejoin, so an ICE restart after expiry cannot allocate.
 # A trailing newline in the secret env value is trimmed.
+
+# Optional workplace archive. Configure a persistent private volume and a base64
+# 32-byte random key. Keep the key in a secret manager; losing it loses archives.
+# [storage]
+# path = "/var/lib/ecochain/archives"
+# master_key_env = "ECOCHAIN_ARCHIVE_MASTER_KEY"
+# retention_days = 30
+
+# Optional recording and short-chunk speech worker. Requires storage + FFmpeg.
+# Use a private, capacity-limited local temp volume; plaintext exists here only
+# during processing. Startup cleans only marked Ecochain worker directories.
+# [recording]
+# ffmpeg = "/usr/bin/ffmpeg"
+# temp_path = "/var/lib/ecochain/processing"
+# max_duration_secs = 14400
+# max_bytes = 4294967296
+
+# OpenAI-compatible audio transcription endpoint (multipart model/file).
+# Select a model supported by your provider; credentials remain server-side.
+# [providers.stt]
+# endpoint = "https://api.openai.com/v1/audio/transcriptions"
+# api_key_env = "ECOCHAIN_STT_API_KEY"
+# model = "YOUR_SUPPORTED_TRANSCRIPTION_MODEL"
+# response_format = "json" # or verbose_json for models supporting timed segments
+# language = "uz"         # optional; omit for provider language detection
+
+# OpenAI-compatible chat completion endpoint with JSON-object response support.
+# [providers.summary]
+# endpoint = "https://api.openai.com/v1/chat/completions"
+# api_key_env = "ECOCHAIN_SUMMARY_API_KEY"
+# model = "YOUR_SUPPORTED_SUMMARY_MODEL"
+
+# Jira Cloud origin, configured issue type, and explicit project allowlist.
+# Use an API token compatible with this site's /rest/api/3 endpoint. Scoped
+# api.atlassian.com/ex/jira URLs are not supported by this adapter.
+# [providers.jira]
+# base_url = "https://YOUR_SITE.atlassian.net"
+# email = "service-account@example.com"
+# api_token_env = "ECOCHAIN_JIRA_API_TOKEN"
+# project_keys = ["WORK"]
+# issue_type_id = "10001" # replace with the site's actual issue type ID
+# issue_type_name = "Task"
+# [providers.jira.identity_account_ids]
+# "meeting-user-identity" = "jira-account-id"

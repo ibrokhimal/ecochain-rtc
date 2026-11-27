@@ -157,3 +157,64 @@ C → {"v":1,"type":"publisher.offer","id":"r3","data":{"sdp":"v=0...","tracks":
 S → {"v":1,"type":"response","id":"r3","ok":true,"data":{"sdp":"v=0..."}}
 S → (boshqalarga) {"v":1,"type":"participant.updated","data":{"participant":{...}}}
 ```
+
+## 10. Workplace collaboration and processing
+
+Admitted join responses include `capabilities` (`work_tools_v1`, optional
+`recording_v1`, optional `captions_v1`), `meeting` snapshot, recording/caption
+status, and optional instance-scoped `archive_token`/host `archive_manage_token`.
+Pending lobby joins instead return `waiting:true`/`waiting_id`; no workspace,
+archive token or media peers are created. `lobby.admitted` carries the normal join
+payload; `lobby.changed` lists waiting entries to hosts only.
+
+`meeting.snapshot {}` returns canonical state. `meeting.action {action:{type,...}}`
+is authorized by server identity/role and returns a revision patch for durable
+mutations. `meeting.changed` broadcasts the same patch:
+
+```json
+{"instance_id":"uuid","revision":12,"patch":{"set":{"presentation":null},"collections":{"notes":{"upsert":[{"id":"n1","text":"Updated","revision":2}],"remove_ids":[]}}}}
+```
+
+Collections merge each partial upsert by `id` (`hands` uses `participant_id`).
+Unmentioned fields remain intact; object deletion does not resend old point arrays.
+The SDK ignores stale patches and requests a full snapshot on a revision gap.
+Durable replies follow successful fsync. Maximum snapshot is 10 MiB, action 32 KiB.
+
+Action families: `presentation.begin/end/pause/offer/decline/policy`, `drawing.policy`,
+`board.open/page`, `object.add/remove/restore/clear`, `hand.set`,
+`poll.create/vote/close`, `question.add/vote/answer`, `agenda.put/start`, `note.put`,
+`decision.put`, `task.put`, `feedback.set`, lobby/room policy and host mute.
+Objects use normalized `[x,y]` point arrays in 0..1, integer ARGB colors and
+normalized widths. Server owns author, presentation IDs and object revisions.
+`meeting.pointer` (20/s, TTL) and `meeting.reaction` (5/s) are ephemeral.
+
+Host `recording.start/stop` and `captions.start/stop` run independent workers;
+`recording.changed`/`captions.changed` broadcast public job status. Live
+`captions.segment` contains `start_ms`, `end_ms`, known `participant_id`, `name`,
+and `text`. Unsupported/unconfigured processing returns an explicit error.
+
+Archive HTTP endpoints (bearer `archive_read`, admitted occurrence membership):
+
+- `GET /v1/archives/{instance}`: workspace, members, provider capabilities and jobs.
+- `GET /v1/archives/{instance}/files/{file}`: authenticated image/recording, supports
+  one byte Range including suffix requests; invalid ranges return 416.
+- `POST .../images`: binary PNG/JPEG ≤5 MiB, requires **live** JWT + drawing rights.
+- `POST .../playback-link {recording_id}`: one-use 60-second handoff URL; fragment
+  contains a nonce, never a long-lived JWT. Player exchanges nonce at
+  `POST .../playback-session {handoff}` for an occurrence-scoped HttpOnly cookie.
+- Admin `POST /v1/archive-tokens {instance_id,identity,ttl_secs}` issues read access
+  after membership verification. RTC and archive token keys/issuers are separate.
+
+Host management bearer `archive_manage` is additionally required for:
+
+- `POST .../transcripts {recording_id}`: idempotent recording transcript job.
+- `POST .../summaries {transcript_job_id?}`: draft from a ready transcript or notes.
+- `POST .../summaries/confirm {confirmed:true,confirmation:{job_id,expected_revision,draft}}`:
+  atomic reviewed summary/decisions/tasks, revision conflicts return 409.
+- `GET .../jira/projects`, `POST .../jira/preview` with task_id, project_key,
+  summary, description, optional assignee_identity/due_date.
+- `POST .../jira/{job_id}/submit {confirmed:true,preview_hash}`: hash binds reviewed
+  payload **and origin**. Pending/uncertain retries reconcile only and do not repeat
+  POST. Ready/failed jobs and uncertain status remain visible in archive results.
+
+See [workplace setup](WORK_MEETING_BACKEND.md) for limits and platform boundaries.

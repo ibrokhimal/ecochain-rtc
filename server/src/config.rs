@@ -5,6 +5,7 @@
 //! end up in a file that is committed or copied around. Inline secrets are only
 //! accepted in [`Mode::Development`].
 
+use anyhow::Context;
 use serde::Deserialize;
 use std::{
     fmt,
@@ -68,6 +69,10 @@ struct FileConfig {
     #[serde(default)]
     rooms: RoomsConfig,
     media: FileMediaConfig,
+    storage: Option<FileStorageConfig>,
+    recording: Option<FileRecordingConfig>,
+    #[serde(default)]
+    providers: FileProvidersConfig,
 }
 
 /// HTTP and WebSocket listener settings.
@@ -264,6 +269,151 @@ pub struct MediaConfig {
     pub turn: Option<TurnConfig>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileStorageConfig {
+    path: PathBuf,
+    master_key_env: String,
+    #[serde(default = "default_retention_days")]
+    retention_days: u64,
+}
+fn default_retention_days() -> u64 {
+    30
+}
+
+/// Validated private archive storage; the master key never appears in Debug output.
+#[derive(Debug, Clone)]
+pub struct StorageConfig {
+    /// Persistent volume directory.
+    pub path: PathBuf,
+    /// Base64 encoded AES-256 wrapping key resolved from environment.
+    pub master_key: Secret,
+    /// Retention in seconds.
+    pub retention_secs: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileRecordingConfig {
+    #[serde(default = "default_ffmpeg")]
+    ffmpeg: PathBuf,
+    temp_path: Option<PathBuf>,
+    #[serde(default = "default_recording_duration")]
+    max_duration_secs: u64,
+    #[serde(default = "default_recording_bytes")]
+    max_bytes: u64,
+}
+fn default_ffmpeg() -> PathBuf {
+    PathBuf::from("ffmpeg")
+}
+fn default_recording_duration() -> u64 {
+    4 * 3600
+}
+fn default_recording_bytes() -> u64 {
+    4 * 1024 * 1024 * 1024
+}
+/// Optional bounded FFmpeg recording worker configuration.
+#[derive(Debug, Clone)]
+pub struct RecordingConfig {
+    /// FFmpeg executable; invoked directly without a shell.
+    pub ffmpeg: PathBuf,
+    /// Private transient plaintext spool, removed on completion or failure.
+    pub temp_path: PathBuf,
+    /// Maximum recording duration before automatic finalization.
+    pub max_duration_secs: u64,
+    /// Maximum encoded input bytes before explicit recording failure.
+    pub max_bytes: u64,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileProvidersConfig {
+    stt: Option<FileSttConfig>,
+    summary: Option<FileSummaryConfig>,
+    jira: Option<FileJiraConfig>,
+}
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileSttConfig {
+    endpoint: String,
+    api_key_env: String,
+    model: String,
+    #[serde(default = "default_response_format")]
+    response_format: String,
+    language: Option<String>,
+}
+fn default_response_format() -> String {
+    "json".to_owned()
+}
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileSummaryConfig {
+    endpoint: String,
+    api_key_env: String,
+    model: String,
+}
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileJiraConfig {
+    base_url: String,
+    email: String,
+    api_token_env: String,
+    project_keys: Vec<String>,
+    issue_type_id: String,
+    #[serde(default = "default_issue_name")]
+    issue_type_name: String,
+    #[serde(default)]
+    identity_account_ids: std::collections::BTreeMap<String, String>,
+}
+fn default_issue_name() -> String {
+    "Task".to_owned()
+}
+fn provider_secret(env_name: &str, env: &dyn Fn(&str) -> Option<String>) -> anyhow::Result<Secret> {
+    let secret = env(env_name).context("provider credential environment variable is missing")?;
+    let secret = secret.trim();
+    anyhow::ensure!(
+        !secret.is_empty() && !secret.chars().any(char::is_control),
+        "invalid provider credential"
+    );
+    Ok(Secret::new(secret))
+}
+fn provider_url(value: &str, production: bool) -> anyhow::Result<String> {
+    let url = reqwest::Url::parse(value).context("invalid provider endpoint")?;
+    anyhow::ensure!(
+        url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
+            && url.host_str().is_some(),
+        "provider endpoint must not contain credentials, query or fragment"
+    );
+    let local = url.host_str().is_some_and(|host| {
+        host == "localhost"
+            || host.parse::<std::net::IpAddr>().is_ok_and(|ip| {
+                ip.is_loopback()
+                    || match ip {
+                        std::net::IpAddr::V4(ip) => ip.is_private(),
+                        std::net::IpAddr::V6(ip) => ip.is_unique_local(),
+                    }
+            })
+    });
+    anyhow::ensure!(
+        url.scheme() == "https" || (!production && url.scheme() == "http" && local),
+        "provider HTTPS required except local development"
+    );
+    Ok(url.to_string())
+}
+fn valid_provider_identity(id: &str) -> bool {
+    crate::auth::valid_id(id)
+}
+fn provider_model(model: &str) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        !model.trim().is_empty() && model.len() <= 128 && !model.chars().any(char::is_control),
+        "invalid provider model"
+    );
+    Ok(model.to_owned())
+}
+
 /// Fully validated server configuration.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -277,6 +427,12 @@ pub struct Config {
     pub rooms: RoomsConfig,
     /// Media sockets.
     pub media: MediaConfig,
+    /// Optional encrypted archive storage.
+    pub storage: Option<StorageConfig>,
+    /// Optional background recorder; requires archive storage.
+    pub recording: Option<RecordingConfig>,
+    /// Explicitly configured transcription, summary and Jira adapters.
+    pub providers: crate::providers::ProvidersConfig,
 }
 
 impl Config {
@@ -405,7 +561,149 @@ pub fn parse(
         }
     };
 
+    let storage = match file.storage {
+        None => None,
+        Some(storage) => {
+            use base64::Engine;
+            let key = env(&storage.master_key_env)
+                .context("storage master key environment variable is missing")?;
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(key.trim())
+                .context("storage master key must be base64")?;
+            anyhow::ensure!(
+                decoded.len() == 32,
+                "storage master key must decode to 32 bytes"
+            );
+            anyhow::ensure!(
+                (1..=3650).contains(&storage.retention_days),
+                "storage retention_days must be 1..3650"
+            );
+            Some(StorageConfig {
+                path: base.join(storage.path),
+                master_key: Secret::new(key.trim()),
+                retention_secs: storage.retention_days * 86400,
+            })
+        }
+    };
+    let recording = match file.recording {
+        None => None,
+        Some(recording) => {
+            let store = storage
+                .as_ref()
+                .context("recording requires configured encrypted storage")?;
+            anyhow::ensure!(
+                (1..=86400).contains(&recording.max_duration_secs),
+                "recording max_duration_secs must be 1..86400"
+            );
+            anyhow::ensure!(
+                (1024 * 1024..=64u64 * 1024 * 1024 * 1024).contains(&recording.max_bytes),
+                "recording max_bytes out of bounds"
+            );
+            Some(RecordingConfig {
+                ffmpeg: recording.ffmpeg,
+                temp_path: recording
+                    .temp_path
+                    .map_or_else(|| store.path.join("work"), |p| base.join(p)),
+                max_duration_secs: recording.max_duration_secs,
+                max_bytes: recording.max_bytes,
+            })
+        }
+    };
+    let stt = match file.providers.stt {
+        None => None,
+        Some(p) => {
+            anyhow::ensure!(
+                recording.is_some(),
+                "STT requires recording/FFmpeg configuration"
+            );
+            anyhow::ensure!(
+                ["json", "verbose_json"].contains(&p.response_format.as_str()),
+                "STT response_format must be json or verbose_json"
+            );
+            anyhow::ensure!(
+                p.language.as_ref().is_none_or(|v| !v.is_empty()
+                    && v.len() <= 16
+                    && v.bytes().all(|c| c.is_ascii_alphabetic() || c == b'-')),
+                "invalid STT language"
+            );
+            Some(crate::providers::SttConfig {
+                endpoint: provider_url(&p.endpoint, production)?,
+                api_key: provider_secret(&p.api_key_env, env)?,
+                model: provider_model(&p.model)?,
+                response_format: p.response_format,
+                language: p.language,
+            })
+        }
+    };
+    let summary = match file.providers.summary {
+        None => None,
+        Some(p) => Some(crate::providers::SummaryConfig {
+            endpoint: provider_url(&p.endpoint, production)?,
+            api_key: provider_secret(&p.api_key_env, env)?,
+            model: provider_model(&p.model)?,
+        }),
+    };
+    let jira = match file.providers.jira {
+        None => None,
+        Some(p) => {
+            let base_url = provider_url(&p.base_url, production)?;
+            let url = reqwest::Url::parse(&base_url)?;
+            anyhow::ensure!(
+                url.path() == "/",
+                "Jira base_url must be an origin without a path"
+            );
+            anyhow::ensure!(
+                !p.email.is_empty()
+                    && p.email.len() <= 254
+                    && !p.email.chars().any(char::is_control),
+                "invalid Jira email"
+            );
+            anyhow::ensure!(
+                !p.project_keys.is_empty()
+                    && p.project_keys.len() <= 100
+                    && p.project_keys.iter().all(|key| key.len() <= 32
+                        && key.as_bytes().first().is_some_and(u8::is_ascii_uppercase)
+                        && key
+                            .bytes()
+                            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_')),
+                "Jira project allowlist required"
+            );
+            anyhow::ensure!(
+                !p.issue_type_id.is_empty()
+                    && p.issue_type_id.len() <= 64
+                    && p.issue_type_id.bytes().all(|c| c.is_ascii_digit()),
+                "invalid Jira issue type ID"
+            );
+            anyhow::ensure!(
+                p.identity_account_ids.len() <= 1000
+                    && p.identity_account_ids
+                        .iter()
+                        .all(|(id, account)| valid_provider_identity(id)
+                            && !account.is_empty()
+                            && account.len() <= 128
+                            && !account.chars().any(char::is_control)),
+                "invalid Jira identity mapping"
+            );
+            Some(crate::providers::JiraConfig {
+                base_url,
+                email: p.email,
+                api_token: provider_secret(&p.api_token_env, env)?,
+                project_keys: p.project_keys,
+                issue_type_id: p.issue_type_id,
+                issue_type_name: p.issue_type_name,
+                identity_account_ids: p.identity_account_ids,
+            })
+        }
+    };
+    anyhow::ensure!(
+        storage.is_some() || (stt.is_none() && summary.is_none() && jira.is_none()),
+        "providers require encrypted archive storage"
+    );
+    let providers = crate::providers::ProvidersConfig { stt, summary, jira };
     Ok(Config {
+        providers,
+        storage,
+        recording,
         mode: file.mode,
         http,
         auth: AuthConfig {

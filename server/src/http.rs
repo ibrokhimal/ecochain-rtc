@@ -31,6 +31,8 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/v1/rooms/{room_id}", delete(end_room))
         .route("/v1/tokens", post(issue_token))
         .route("/v1/dev/token", post(dev_token))
+        .merge(crate::archive::routes())
+        .merge(crate::providers::jobs::routes())
         .with_state(app)
 }
 
@@ -39,7 +41,7 @@ fn error(status: StatusCode, message: &str) -> Response {
 }
 
 /// Checks `Authorization: Bearer <admin key>` in constant time.
-fn is_admin(app: &App, headers: &HeaderMap) -> bool {
+pub(crate) fn is_admin(app: &App, headers: &HeaderMap) -> bool {
     let Some(given) = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())

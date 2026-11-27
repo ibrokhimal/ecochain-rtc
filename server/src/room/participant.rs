@@ -248,6 +248,8 @@ pub struct Participant {
     pub role: Role,
     /// May publish media.
     pub can_publish: bool,
+    /// Host mute persists across renegotiation until an explicit self-unmute.
+    pub host_muted: bool,
     /// Latest `exp` of the tokens this session joined with. A host removal
     /// must outlive it, or the token could simply be reused.
     pub token_exp: u64,
@@ -280,6 +282,7 @@ impl Participant {
             name: claims.name.clone().unwrap_or_else(|| claims.sub.clone()),
             role: claims.role,
             can_publish: claims.can_publish,
+            host_muted: false,
             token_exp: claims.exp,
             session_id,
             conn: Some(conn),

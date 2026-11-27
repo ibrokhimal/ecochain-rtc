@@ -19,6 +19,8 @@ use std::{
 /// in its task, so the lock here is held for map operations only.
 pub struct Rooms {
     config: Arc<Config>,
+    vault: Option<Arc<crate::storage::Vault>>,
+    provider_slots: Arc<tokio::sync::Semaphore>,
     metrics: Arc<Metrics>,
     sockets: MediaSockets,
     me: Weak<Rooms>,
@@ -33,9 +35,17 @@ pub struct Rooms {
 
 impl Rooms {
     /// Creates an empty registry.
-    pub fn new(config: Arc<Config>, metrics: Arc<Metrics>, sockets: MediaSockets) -> Arc<Self> {
+    pub fn new(
+        config: Arc<Config>,
+        metrics: Arc<Metrics>,
+        sockets: MediaSockets,
+        vault: Option<Arc<crate::storage::Vault>>,
+        provider_slots: Arc<tokio::sync::Semaphore>,
+    ) -> Arc<Self> {
         Arc::new_cyclic(|me| Self {
             config,
+            vault,
+            provider_slots,
             metrics,
             sockets,
             me: me.clone(),
@@ -47,6 +57,8 @@ impl Rooms {
 
     fn services(&self) -> RoomServices {
         RoomServices {
+            vault: self.vault.clone(),
+            provider_slots: self.provider_slots.clone(),
             config: self.config.clone(),
             metrics: self.metrics.clone(),
             sockets: self.sockets.clone(),

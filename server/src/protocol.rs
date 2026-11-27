@@ -238,6 +238,15 @@ pub struct JoinRequest {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum SessionRequest {
+    /// Read the authoritative workplace snapshot.
+    #[serde(rename = "meeting.snapshot")]
+    MeetingSnapshot {},
+    /// Apply a validated workplace action.
+    #[serde(rename = "meeting.action")]
+    MeetingAction {
+        /// Typed by the collaboration reducer and bounded independently of SDP.
+        action: Value,
+    },
     /// Leave the room and release all resources.
     #[serde(rename = "leave")]
     Leave {},
@@ -312,7 +321,10 @@ impl SessionRequest {
     /// Whether the request changes state and therefore needs duplicate
     /// detection by request id. Pings are cheap and idempotent anyway.
     pub fn needs_dedup(&self) -> bool {
-        !matches!(self, SessionRequest::Ping {})
+        !matches!(
+            self,
+            SessionRequest::Ping {} | SessionRequest::MeetingSnapshot {}
+        )
     }
 }
 

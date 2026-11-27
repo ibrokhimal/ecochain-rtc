@@ -340,7 +340,8 @@ impl Room {
                 .iter_mut()
                 .find(|t| t.mid == mid && t.source == offered.source)
             {
-                track.muted = offered.muted;
+                track.muted = offered.muted
+                    || (participant.host_muted && offered.source == TrackSource::Microphone);
                 track.layers = layers;
                 // Gates of layers that are gone would only keep deferred
                 // requests for a rid the publisher no longer sends.
@@ -364,7 +365,8 @@ impl Room {
                         MediaKind::Audio
                     },
                     source: offered.source,
-                    muted: offered.muted,
+                    muted: offered.muted
+                        || (participant.host_muted && offered.source == TrackSource::Microphone),
                     layers,
                     keyframes: HashMap::new(),
                     orientation: None,
@@ -848,10 +850,21 @@ impl Room {
             .metrics
             .media_in_total
             .fetch_add(1, Ordering::Relaxed);
+        let screen_allowed = self.screen_media_allowed(
+            &self.participants[index].id,
+            self.participants[index].role == crate::auth::Role::Host,
+        );
         let publisher = &mut self.participants[index];
         let Some(track) = publisher.tracks.iter_mut().find(|t| t.mid == data.mid) else {
             return;
         };
+        if track.source == TrackSource::Microphone && publisher.host_muted {
+            return;
+        }
+        if matches!(track.source, TrackSource::Screen | TrackSource::ScreenAudio) && !screen_allowed
+        {
+            return;
+        }
         if data.is_keyframe() {
             // The deferred request, if any, is satisfied. Never inserts: the
             // rid comes from the network.
@@ -866,6 +879,75 @@ impl Room {
             (track.id.clone(), track.kind, track.orientation, track.muted);
         let publisher_id = publisher.id.clone();
         let now = Instant::now();
+        if !muted {
+            if let Some(recording) = &self.recording {
+                let rank = data
+                    .rid
+                    .and_then(|rid| track.layers.iter().position(|r| *r == rid))
+                    .unwrap_or(0);
+                let selected = self
+                    .recording_layers
+                    .entry(track_id.clone())
+                    .or_insert((rank, now));
+                let chosen =
+                    rank >= selected.0 || now.duration_since(selected.1) > Duration::from_secs(1);
+                if chosen && data.network_time >= recording.start {
+                    *selected = (rank, now);
+                    let codec = match data.params.spec().codec {
+                        str0m::format::Codec::H264 => Some(crate::recording::RecordingCodec::H264),
+                        str0m::format::Codec::Vp8 => Some(crate::recording::RecordingCodec::Vp8),
+                        str0m::format::Codec::Opus => Some(crate::recording::RecordingCodec::Opus),
+                        _ => None,
+                    };
+                    if let Some(codec) = codec {
+                        let sender_ms = data.last_sender_info.as_ref().and_then(|info| {
+                            info.ntp_time
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .ok()
+                                .map(|ntp| {
+                                    ntp.as_micros() as f64 / 1000.0
+                                        + (data.time.numer() as u32)
+                                            .wrapping_sub(info.rtp_time.numer() as u32)
+                                            as i32 as f64
+                                            * 1000.0
+                                            / data.time.denom() as f64
+                                })
+                        });
+                        let rotation = match orientation {
+                            Some(str0m::rtp::VideoOrientation::Deg90) => 90,
+                            Some(str0m::rtp::VideoOrientation::Deg180) => 180,
+                            Some(str0m::rtp::VideoOrientation::Deg270) => 270,
+                            _ => 0,
+                        };
+                        recording.frame(crate::recording::RecordedFrame {
+                            track_id: track_id.clone(),
+                            participant_id: publisher_id.clone(),
+                            name: publisher.name.clone(),
+                            source: match track.source {
+                                TrackSource::Microphone => "microphone",
+                                TrackSource::Camera => "camera",
+                                TrackSource::Screen => "screen",
+                                TrackSource::ScreenAudio => "screen_audio",
+                            }
+                            .to_owned(),
+                            codec,
+                            layer: data.rid.map(|r| r.to_string()).unwrap_or_default(),
+                            rotation,
+                            arrival_ms: data
+                                .network_time
+                                .duration_since(recording.start)
+                                .as_millis() as u64,
+                            sender_ms,
+                            data: data.data.clone(),
+                            keyframe: data.is_keyframe(),
+                            contiguous: data.contiguous,
+                        });
+                    } else {
+                        recording.unsupported();
+                    }
+                }
+            }
+        }
 
         let mut audio_level = None;
         if kind == MediaKind::Audio {
@@ -878,6 +960,20 @@ impl Room {
                 return;
             }
             audio_level = level.map(|l| (l, voice));
+            if let Some(captions) = &self.captions {
+                if data.params.spec().codec == str0m::format::Codec::Opus
+                    && data.network_time >= captions.start
+                    && (voice || level.is_none_or(|l| l >= -70))
+                {
+                    captions.frame(crate::providers::captions::CaptionFrame {
+                        participant_id: publisher_id.clone(),
+                        name: publisher.name.clone(),
+                        time_ms: data.network_time.duration_since(captions.start).as_millis()
+                            as u64,
+                        data: data.data.clone(),
+                    });
+                }
+            }
         } else if !data.contiguous {
             // Packets were lost beyond what NACK recovered; the decoder
             // needs a fresh keyframe.
@@ -1014,7 +1110,7 @@ impl Room {
     /// Asks the publisher for a keyframe of one layer. Requests inside the
     /// layer's throttle window are deferred and sent by `flush_keyframes`.
     /// `urgent` (new subscription, layer switch) uses a shorter window.
-    fn request_keyframe(
+    pub(super) fn request_keyframe(
         &mut self,
         publisher_id: &str,
         track_id: &str,
@@ -1088,6 +1184,16 @@ impl Room {
         self.keyframes_due = next;
     }
 
+    // Shared by forwarding, recording/captions (tap occurs after the gate) and demand allocation.
+    pub(super) fn screen_media_allowed(&self, publisher: &str, host: bool) -> bool {
+        let p = &self.collaboration.state["presentation"];
+        let permitted = self.collaboration.state["presentation_policy"] != "host_or_invited"
+            || host
+            || (p["presenter_id"] == publisher && p["invited"] == true);
+        permitted
+            && (p.is_null()
+                || (p["paused"] != true && p["kind"] == "screen" && p["presenter_id"] == publisher))
+    }
     /// Eligible subscribed remote audio, independent of instantaneous speaker silence.
     pub(super) fn audio_demand_counts(&self, index: usize) -> (usize, usize) {
         let me = &self.participants[index];
@@ -1109,7 +1215,14 @@ impl Room {
                 }
                 match track.source {
                     TrackSource::Microphone => microphones += 1,
-                    TrackSource::ScreenAudio => screens += 1,
+                    TrackSource::ScreenAudio
+                        if self.screen_media_allowed(
+                            &publisher.id,
+                            publisher.role == crate::auth::Role::Host,
+                        ) =>
+                    {
+                        screens += 1
+                    }
                     _ => {}
                 }
             }
@@ -1119,6 +1232,12 @@ impl Room {
 
     /// Allocate video independently for this receiver, reserving audio and overhead.
     pub(super) fn allocate_layers(&mut self, index: usize) {
+        let allowed_screens: HashSet<_> = self
+            .participants
+            .iter()
+            .filter(|p| self.screen_media_allowed(&p.id, p.role == crate::auth::Role::Host))
+            .map(|p| p.id.clone())
+            .collect();
         let now = Instant::now();
         let speakers: HashSet<_> = self
             .current_speakers(now)
@@ -1146,6 +1265,8 @@ impl Room {
                 o.kind == MediaKind::Video
                     && o.state.is_wanted()
                     && participant.video_subscriptions.contains_key(&o.track_id)
+                    && (o.source != TrackSource::Screen
+                        || allowed_screens.contains(&o.publisher_id))
             })
             .filter(|(_, o)| tracks.get(&o.track_id).is_some_and(|(_, muted)| !muted))
             .map(|(i, _)| i)

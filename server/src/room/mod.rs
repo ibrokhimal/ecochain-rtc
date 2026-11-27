@@ -9,9 +9,15 @@
 #[cfg(test)]
 mod adaptation_tests;
 mod audio;
+mod captions;
+mod collaboration;
 mod keyframe;
+mod lobby;
 mod media;
+mod moderation;
 mod participant;
+mod persistence;
+mod recording;
 mod video;
 
 pub use participant::Connection;
@@ -56,6 +62,36 @@ pub enum JoinOutcome {
 
 /// Messages a room accepts.
 pub enum RoomCommand {
+    /// Apply a host-reviewed draft to an exact live meeting instance.
+    ConfirmSummary {
+        instance: String,
+        identity: String,
+        confirmation: crate::providers::SummaryConfirmation,
+        reply: oneshot::Sender<Result<Value, ProtocolError>>,
+    },
+    /// Public live transcription status, with no credentials or audio paths.
+    CaptionsStatus { state: Value },
+    /// Newly transcribed, bounded utterance for all admitted clients.
+    CaptionSegment { job_id: String, segment: Value },
+    /// Recording worker status; playback artifacts are already persisted.
+    RecordingStatus {
+        /// Public job metadata, with no storage paths or encryption keys.
+        state: Value,
+    },
+    /// Check a live member's rights before an image upload.
+    AuthorizeImage {
+        /// Exact meeting occurrence, not a reusable room name.
+        instance: String,
+        /// Verified token identity.
+        identity: String,
+        /// Upload authorization result.
+        reply: oneshot::Sender<bool>,
+    },
+    /// Blocking persistence worker completed one pending commit.
+    WorkspacePersisted {
+        /// Whether the encrypted journal was fsynced.
+        success: bool,
+    },
     /// Test-only controller; absent from server binaries and wire protocol.
     #[cfg(test)]
     TestAdaptation {
@@ -133,6 +169,10 @@ impl RoomHandle {
 /// Shared services a room needs.
 #[derive(Clone)]
 pub struct RoomServices {
+    /// Optional archive store; blocking calls run off the actor.
+    pub vault: Option<Arc<crate::storage::Vault>>,
+    /// Shared bounded external-provider HTTP concurrency.
+    pub provider_slots: Arc<tokio::sync::Semaphore>,
     /// Configuration.
     pub config: Arc<Config>,
     /// Counters.
@@ -154,19 +194,29 @@ pub fn spawn(
     let (packets_tx, packets_rx) = mpsc::channel(8192);
     let handle = RoomHandle {
         id: id.clone(),
-        commands: commands_tx,
+        commands: commands_tx.clone(),
     };
     services
         .metrics
         .rooms_active
         .fetch_add(1, Ordering::Relaxed);
     let audio = AudioSelector::new(services.config.rooms.max_forwarded_audio);
-    let room = Room {
+    let mut room = Room {
         id,
         max_participants,
         services,
         packets_tx,
         participants: Vec::new(),
+        collaboration: collaboration::Collaboration::default(),
+        persistence: Default::default(),
+        lobby: Default::default(),
+        recording: None,
+        recording_state: Value::Null,
+        recording_layers: Default::default(),
+        captions: None,
+        captions_state: Value::Null,
+        members: Default::default(),
+        commands: commands_tx.clone(),
         routes: HashMap::new(),
         forwarding: HashMap::new(),
         slots: HashMap::new(),
@@ -183,11 +233,22 @@ pub fn spawn(
         #[cfg(test)]
         test_estimates: HashMap::new(),
     };
+    room.collaboration.state["room_id"] = json!(room.id);
     tokio::spawn(room.run(commands_rx, packets_rx, handle.clone()));
     handle
 }
 
 pub(crate) struct Room {
+    collaboration: collaboration::Collaboration,
+    persistence: persistence::Persistence,
+    lobby: lobby::Lobby,
+    recording: Option<crate::recording::RecordingHandle>,
+    recording_state: Value,
+    captions: Option<crate::providers::captions::CaptionHandle>,
+    captions_state: Value,
+    recording_layers: HashMap<String, (usize, Instant)>,
+    members: std::collections::BTreeSet<String>,
+    commands: mpsc::Sender<RoomCommand>,
     #[cfg(test)]
     test_estimates: HashMap<String, u64>,
     id: String,
@@ -278,6 +339,10 @@ impl Room {
         if let Some(rooms) = self.services.rooms.upgrade() {
             rooms.remove(&handle);
         }
+        for index in (0..self.participants.len()).rev() {
+            self.remove_participant(index, None);
+        }
+        self.finish_persistence(&mut commands).await;
         commands.close();
         while let Ok(command) = commands.try_recv() {
             if let RoomCommand::Join {
@@ -299,9 +364,6 @@ impl Room {
                 let _ = reply.send(JoinOutcome::Rejected(code));
             }
         }
-        for index in (0..self.participants.len()).rev() {
-            self.remove_participant(index, None);
-        }
         self.services
             .metrics
             .rooms_active
@@ -318,6 +380,70 @@ impl Room {
 
     fn handle_command(&mut self, command: RoomCommand) {
         match command {
+            RoomCommand::ConfirmSummary {
+                instance,
+                identity,
+                confirmation,
+                reply,
+            } => {
+                if self.collaboration.state["instance_id"] != instance {
+                    let _ = reply.send(Err(ProtocolError::new(
+                        ErrorCode::RoomNotFound,
+                        "meeting instance is not live",
+                    )));
+                } else {
+                    self.persist_summary(identity, confirmation, reply);
+                }
+            }
+            RoomCommand::CaptionsStatus { state } => {
+                if state["id"] != self.captions_state["id"] {
+                    return;
+                }
+                if self.captions_state["status"] == "stopping" && state["status"] == "running" {
+                    return;
+                }
+                self.captions_state = state.clone();
+                if state["status"] == "ready" || state["status"] == "failed" {
+                    self.captions = None;
+                }
+                self.broadcast(Outbound::event("captions.changed", state));
+            }
+            RoomCommand::CaptionSegment { job_id, segment } => {
+                if self.captions_state["id"] == job_id {
+                    self.broadcast(Outbound::event("captions.segment", segment));
+                }
+            }
+            RoomCommand::RecordingStatus { state } => {
+                if state["id"] != self.recording_state["id"] {
+                    return;
+                }
+                if self.recording_state["status"] == "processing" && state["status"] == "recording"
+                {
+                    return;
+                }
+                self.recording_state = state.clone();
+                if state["status"] == "ready" || state["status"] == "failed" {
+                    self.recording = None;
+                    self.recording_layers.clear();
+                }
+                self.broadcast(Outbound::event("recording.changed", state));
+            }
+            RoomCommand::AuthorizeImage {
+                instance,
+                identity,
+                reply,
+            } => {
+                let allowed = self.collaboration.state["instance_id"] == instance
+                    && self.participants.iter().any(|p| {
+                        p.identity == identity
+                            && p.conn.is_some()
+                            && self
+                                .collaboration
+                                .allows_drawing(&p.id, p.role == Role::Host)
+                    });
+                let _ = reply.send(allowed);
+            }
+            RoomCommand::WorkspacePersisted { success } => self.workspace_persisted(success),
             #[cfg(test)]
             RoomCommand::TestAdaptation {
                 participant_id,
@@ -354,6 +480,12 @@ impl Room {
                 conn,
                 reply,
             } => {
+                if let Some(outcome) =
+                    self.gate_join(&claims, resume.as_deref(), &conn, &request_id)
+                {
+                    let _ = reply.send(outcome);
+                    return;
+                }
                 let result = self.join(&claims, resume.as_deref(), &conn);
                 let outcome = match &result {
                     Ok(_) => JoinOutcome::Joined,
@@ -361,6 +493,8 @@ impl Room {
                 };
                 match result {
                     Ok((index, data)) => {
+                        self.members.insert(claims.sub.clone());
+                        self.persist_members();
                         conn.send(response(&request_id, Ok(data)));
                         // Events (subscriber offer) only after the response.
                         self.after_join(index);
@@ -518,8 +652,22 @@ impl Room {
                 crate::auth::unix_now(),
             ));
         }
+        let mut capabilities = vec!["work_tools_v1"];
+        if config.recording.is_some() {
+            capabilities.push("recording_v1");
+        }
+        if config.providers.stt.is_some() {
+            capabilities.push("captions_v1");
+        }
         let data = json!({
             "protocol": crate::protocol::PROTOCOL_VERSION,
+            "capabilities": capabilities,
+            "captions": self.captions_state,
+            "recording": self.recording_state,
+            "meeting": self.collaboration.state,
+            "lobby": if participant.role==Role::Host {self.lobby_snapshot()} else {json!({"waiting":[]})},
+            "archive_manage_token": if self.services.vault.is_some() && participant.role==Role::Host {Some(crate::archive::issue_manage(config,self.collaboration.state["instance_id"].as_str().unwrap(),&claims.sub,86400))}else{None},
+            "archive_token": self.services.vault.as_ref().map(|_|crate::archive::issue(config,self.collaboration.state["instance_id"].as_str().unwrap(),&claims.sub,86400)),
             "session_id": participant.session_id,
             "resumed": resumed,
             "participant": participant.info(),
@@ -586,6 +734,9 @@ impl Room {
     }
 
     fn request(&mut self, conn: Connection, request_id: String, request: SessionRequest) {
+        if self.pending_request(&conn, &request_id, &request) {
+            return;
+        }
         let Some(index) = self
             .participants
             .iter()
@@ -617,6 +768,12 @@ impl Room {
             }
         }
 
+        if self.services.vault.is_some()
+            && matches!(&request,SessionRequest::MeetingAction{action} if action["type"]!="pointer" && !lobby::is_control(action))
+        {
+            self.persist_workspace(conn, request_id, request, fingerprint);
+            return;
+        }
         let result = self.execute(index, request);
         let (result, after) = match result {
             Ok((data, after)) => (Ok(data), after),
@@ -672,6 +829,47 @@ impl Room {
         request: SessionRequest,
     ) -> Result<(Value, After), ProtocolError> {
         match request {
+            SessionRequest::MeetingSnapshot {} => {
+                Ok((self.collaboration.state.clone(), After::Nothing))
+            }
+            SessionRequest::MeetingAction { action } => {
+                if let Some(result) = self.lobby_request(index, &action) {
+                    return result.map(|value| (value, After::Nothing));
+                }
+                if let Some(result) = self.captions_action(index, &action) {
+                    return result.map(|value| (value, After::Nothing));
+                }
+                if let Some(result) = self.recording_action(index, &action) {
+                    return result.map(|value| (value, After::Nothing));
+                }
+                if let Some(result) = self.moderation_action(index, &action) {
+                    return result.map(|value| (value, After::Nothing));
+                }
+                self.validate_meeting_action(index, &action)?;
+                let participant = &self.participants[index];
+                if action["type"] == "pointer" {
+                    let event = self.collaboration.pointer(
+                        &participant.id,
+                        participant.role == Role::Host,
+                        &action,
+                    )?;
+                    self.broadcast(Outbound::event("meeting.pointer", event));
+                    return Ok((json!({}), After::Nothing));
+                }
+                let previous = self.collaboration.state.clone();
+                let state = self.collaboration.apply(
+                    &participant.id,
+                    &participant.identity,
+                    participant.role == Role::Host,
+                    action,
+                )?;
+                for receiver in 0..self.participants.len() {
+                    self.allocate_layers(receiver);
+                }
+                let change = collaboration::delta(&previous, &state);
+                self.broadcast(Outbound::event("meeting.changed", change.clone()));
+                Ok((change, After::Nothing))
+            }
             // Normally answered by the signaling task; kept for completeness.
             SessionRequest::Ping {} => Ok((json!({}), After::Nothing)),
             SessionRequest::Leave {} => Ok((json!({}), After::Leave)),
@@ -716,6 +914,9 @@ impl Room {
                 Ok((json!({}), After::Negotiate))
             }
             SessionRequest::TrackMute { source, muted } => {
+                if source == crate::protocol::TrackSource::Microphone && !muted {
+                    self.participants[index].host_muted = false;
+                }
                 self.mute(index, source, muted)?;
                 Ok((json!({}), After::Nothing))
             }
@@ -724,6 +925,38 @@ impl Room {
                 Ok((json!({}), After::Negotiate))
             }
         }
+    }
+
+    fn validate_meeting_action(&self, index: usize, action: &Value) -> Result<(), ProtocolError> {
+        if action["type"] == "presentation.offer"
+            && !self.participants.iter().any(|p| {
+                Some(p.id.as_str()) == action["participant_id"].as_str()
+                    && p.can_publish
+                    && p.conn.is_some()
+            })
+        {
+            return Err(ProtocolError::new(
+                ErrorCode::BadRequest,
+                "target cannot present",
+            ));
+        }
+        if action["type"] == "task.put" {
+            if let Some(identity) = action["assignee"].as_str().filter(|id| !id.is_empty()) {
+                if !self.participants.iter().any(|p| p.identity == identity) {
+                    return Err(ProtocolError::new(
+                        ErrorCode::BadRequest,
+                        "assignee is not a meeting member",
+                    ));
+                }
+            }
+        }
+        if action["type"] == "presentation.begin" && !self.participants[index].can_publish {
+            return Err(ProtocolError::new(
+                ErrorCode::Forbidden,
+                "publishing is not permitted",
+            ));
+        }
+        Ok(())
     }
 
     fn require_host(&self, index: usize) -> Result<(), ProtocolError> {
@@ -738,6 +971,7 @@ impl Room {
     }
 
     fn disconnected(&mut self, conn_id: u64) {
+        self.lobby_disconnected(conn_id);
         let Some(index) = self
             .participants
             .iter()
@@ -758,6 +992,7 @@ impl Room {
     }
 
     fn end(&mut self, reason: &'static str) {
+        self.end_lobby();
         if let Some(rooms) = self.services.rooms.upgrade() {
             rooms.mark_ended(&self.id);
         }
@@ -778,6 +1013,14 @@ impl Room {
     fn remove_participant(&mut self, index: usize, reason: Option<&str>) {
         self.close_media(index);
         let participant = self.participants.remove(index);
+        let previous = self.collaboration.state.clone();
+        if self.collaboration.remove_participant(&participant.id) {
+            self.broadcast(Outbound::event(
+                "meeting.changed",
+                collaboration::delta(&previous, &self.collaboration.state),
+            ));
+            self.persist_members();
+        }
         self.forwarding_dirty = true;
         self.forget_routes(&participant.id, None);
         self.services
@@ -795,12 +1038,19 @@ impl Room {
             }
         }
         if self.participants.is_empty() {
+            if let Some(recording) = &self.recording {
+                recording.stop();
+            }
+            if let Some(captions) = &self.captions {
+                captions.stop();
+            }
             self.empty_since = Some(Instant::now());
         }
         self.negotiate_all();
     }
 
     fn housekeeping(&mut self) {
+        self.expire_lobby();
         let now = Instant::now();
         let grace = self.services.config.rooms.reconnect_grace();
         while let Some(index) = self
@@ -825,6 +1075,22 @@ impl Room {
         }
 
         self.media_housekeeping(now);
+    }
+
+    fn broadcast(&self, message: Outbound) {
+        if let (
+            Some(recording),
+            Outbound::Event {
+                kind: "meeting.changed",
+                data,
+            },
+        ) = (&self.recording, &message)
+        {
+            recording.workspace(data);
+        }
+        for participant in &self.participants {
+            participant.send(message.clone());
+        }
     }
 
     fn broadcast_except(&self, index: usize, message: Outbound) {
