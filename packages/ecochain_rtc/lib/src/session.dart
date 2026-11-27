@@ -11,6 +11,7 @@ import 'internal/interruptions.dart';
 import 'internal/serial.dart';
 import 'internal/signal_client.dart';
 import 'internal/system_call.dart';
+import 'internal/video_codec.dart';
 import 'options.dart';
 import 'participant.dart';
 import 'subscription_policy.dart';
@@ -600,6 +601,7 @@ class RtcSession extends ChangeNotifier {
       ),
     );
     _senders[source] = transceiver;
+    if (source.isVideo) await configureVideoCodecs(transceiver);
   }
 
   Future<void> _sendMute(RtcTrackSource source, bool muted) async {
